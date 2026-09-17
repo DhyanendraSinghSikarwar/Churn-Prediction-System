@@ -1,0 +1,14 @@
+# Placeholder — populated in Phase 4 (notebooks/04_modelling_experiments.ipynb)
+# once the feature set is finalized and baseline results exist to tune
+# against. Kept here now (rather than omitted) so the config file layout
+# referenced by Deliverable 1 exists from Phase 1 onward.
+
+cv:
+  n_splits: 5
+  group_column: customer_id  # GroupKFold — see DECISIONS.md#leakage-mitigations
+
+optuna:
+  n_trials: 50
+  timeout_seconds: 1800
+
+models: {}  # search spaces added per-model in Phase 4

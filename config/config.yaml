@@ -1,0 +1,55 @@
+# Business / pipeline configuration. No secrets — see .env.example and
+# DECISIONS.md#secrets-never-in-yaml.
+
+data:
+  snapshot_date: "2024-06-01"        # fixed "today" of the synthetic world
+  panel_start_date: "2023-01-01"     # first monthly scoring cohort
+  panel_end_date: "2024-06-01"       # last monthly scoring cohort
+  prediction_horizon_days: 30        # label = churn within N days of reference_date
+  train_months: 12
+  validation_months: 3
+  test_months: 3
+  source:
+    primary_url: "https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp4d/master/data/Telco-Customer-Churn.csv"
+    fallback_url: "https://raw.githubusercontent.com/treselle-systems/customer_churn_analysis/master/WA_Fn-UseC_-Telco-Customer-Churn.csv"
+    expected_row_count: 7043
+    raw_cache_path: "data/raw/telco_customer_churn.csv"
+
+# Parameters for the synthetic temporal layer (billing_events,
+# support_tickets, churn placement). Every value here is a documented,
+# seeded assumption — not fitted to real telecom data. See
+# DECISIONS.md (Phase 1 section) for the reasoning behind each one.
+synthetic:
+  random_seed: 42
+  payment_failure:
+    base_rate: 0.02
+    electronic_check_uplift: 0.06
+    month_to_month_uplift: 0.03
+  support_tickets:
+    base_monthly_rate: 0.15
+    no_tech_support_uplift: 0.10
+    no_online_security_uplift: 0.05
+    pre_churn_window_days: 60
+    pre_churn_multiplier: 2.5
+
+feature_set:
+  version: "v1"
+
+mlflow:
+  tracking_uri: "http://localhost:5000"
+  experiment_name: "churn-prediction"
+  registry_model_name: "churn_classifier"
+  # A candidate must beat the current Production model's PR-AUC by at
+  # least this much to be promoted — avoids registry flapping on noise.
+  promotion_epsilon: 0.005
+
+# Illustrative retention-economics assumptions (Deliverable 5/6). The
+# dataset has no real economics in it; these are placeholders to be
+# replaced with real business numbers before any real deployment.
+business:
+  retention_offer_cost: 50.0
+  assumed_ltv_horizon_months: 12
+  offer_success_rate: 0.30
+  risk_bands:
+    low_max: 0.3
+    medium_max: 0.7

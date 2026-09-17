@@ -1,0 +1,34 @@
+# stdlib logging.config.dictConfig. Every stdlib/structlog logger routes
+# through the same JSON formatter (churn.utils.logging.JSONFormatter) so
+# third-party libraries (e.g. sqlalchemy.engine) and our own code emit one
+# consistent, structured stream — never print().
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  json:
+    (): churn.utils.logging.JSONFormatter
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: json
+    stream: ext://sys.stdout
+
+root:
+  level: INFO
+  handlers: [console]
+
+loggers:
+  churn:
+    level: INFO
+    handlers: [console]
+    propagate: false
+  sqlalchemy.engine:
+    level: WARNING
+    handlers: [console]
+    propagate: false
+  alembic:
+    level: INFO
+    handlers: [console]
+    propagate: false
