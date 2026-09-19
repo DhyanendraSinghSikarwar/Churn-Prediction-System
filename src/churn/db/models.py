@@ -183,11 +183,17 @@ class ChurnLabel(Base):
 
 
 class FeatureSnapshot(Base):
-    """The spine of the training/inference panel: one row per
-    (customer_id, reference_date). Phase 1 creates only the keys and the
-    label; typed feature columns are added by a later migration once
-    notebook 03 finalizes the feature set — see
+    """The training/inference panel: one row per (customer_id,
+    reference_date). Phase 1 created only the keys and the label; this is
+    the Phase 2 migration that adds the typed feature columns, computed by
+    sql/features/build_feature_snapshot.sql — see
     DECISIONS.md#feature_snapshots-schema-staged-across-phases.
+
+    This holds the full CANDIDATE feature set. Feature *selection* (mutual
+    information / permutation importance / Boruta / correlation pruning,
+    notebook 03) picks a subset of these columns for the model to actually
+    train on — it does not remove columns from this table. Selection is a
+    modeling-time decision, not a schema change.
     """
 
     __tablename__ = "feature_snapshots"
@@ -199,13 +205,76 @@ class FeatureSnapshot(Base):
             name="uq_feature_snapshots_customer_ref_version",
         ),
         Index("ix_feature_snapshots_reference_date", "reference_date"),
+        CheckConstraint(
+            "tenure_bucket IN ('0-6', '6-12', '12-24', '24-48', '48+')",
+            name="ck_feature_snapshots_tenure_bucket",
+        ),
+        CheckConstraint("tenure_months >= 0", name="ck_feature_snapshots_tenure_months_nonneg"),
+        CheckConstraint(
+            "payment_failure_rate_180d IS NULL " "OR payment_failure_rate_180d BETWEEN 0 AND 1",
+            name="ck_feature_snapshots_payment_failure_rate_range",
+        ),
     )
 
     snapshot_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     customer_id: Mapped[str] = mapped_column(ForeignKey("customers.customer_id"), nullable=False)
     reference_date: Mapped[dt.date] = mapped_column(Date, nullable=False)
     feature_set_version: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    # --- static / plan attributes as of reference_date (see
+    # DECISIONS.md#synthetic-service-attributes-are-static-for-now — safe
+    # at any reference_date >= signup_date) ---
+    senior_citizen: Mapped[bool] = mapped_column(nullable=False)
+    partner: Mapped[bool] = mapped_column(nullable=False)
+    dependents: Mapped[bool] = mapped_column(nullable=False)
+    contract_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    internet_service: Mapped[str] = mapped_column(String(20), nullable=False)
+    online_security: Mapped[str] = mapped_column(String(20), nullable=False)
+    online_backup: Mapped[str] = mapped_column(String(20), nullable=False)
+    device_protection: Mapped[str] = mapped_column(String(20), nullable=False)
+    tech_support: Mapped[str] = mapped_column(String(20), nullable=False)
+    streaming_tv: Mapped[str] = mapped_column(String(20), nullable=False)
+    streaming_movies: Mapped[str] = mapped_column(String(20), nullable=False)
+    paperless_billing: Mapped[bool] = mapped_column(nullable=False)
+    payment_method: Mapped[str] = mapped_column(String(30), nullable=False)
+    monthly_charges: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+
+    # --- tenure, recomputed as of reference_date — never the raw
+    # `tenure` column (DECISIONS.md#leakage-mitigations) ---
+    tenure_months: Mapped[int] = mapped_column(nullable=False)
+    tenure_bucket: Mapped[str] = mapped_column(String(10), nullable=False)
+
+    # --- RFM, all strictly event_date/created_date < reference_date ---
+    recency_days_since_last_charge: Mapped[int | None] = mapped_column(nullable=True)
+    recency_days_since_last_ticket: Mapped[int | None] = mapped_column(nullable=True)
+    frequency_charges_30d: Mapped[int] = mapped_column(nullable=False)
+    frequency_charges_60d: Mapped[int] = mapped_column(nullable=False)
+    frequency_charges_90d: Mapped[int] = mapped_column(nullable=False)
+    frequency_tickets_30d: Mapped[int] = mapped_column(nullable=False)
+    frequency_tickets_60d: Mapped[int] = mapped_column(nullable=False)
+    frequency_tickets_90d: Mapped[int] = mapped_column(nullable=False)
+    monetary_charges_30d: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    monetary_charges_60d: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    monetary_charges_90d: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    # Replaces the leaky raw TotalCharges column — see
+    # DECISIONS.md#total-charges-dropped-at-ingestion.
+    cumulative_charges_to_date: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+
+    # --- trend / velocity ---
+    billing_amount_slope_90d: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
+    billing_amount_mom_delta: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    ticket_velocity_delta_30_60: Mapped[int] = mapped_column(nullable=False)
+    payment_failure_streak: Mapped[int] = mapped_column(nullable=False)
+    payment_failure_rate_180d: Mapped[float | None] = mapped_column(Numeric(5, 4), nullable=True)
+
+    # --- label: churn within prediction_horizon_days of reference_date.
+    # Looks FORWARD from reference_date — that's expected of a supervised
+    # label, not a leak, as long as it never feeds a feature column above.
+    # NULL means the horizon hadn't matured yet when this snapshot was
+    # built (live inference); always populated for historical/training
+    # snapshots in this dataset. ---
     label_churn_next_30d: Mapped[bool | None] = mapped_column(nullable=True)
+
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

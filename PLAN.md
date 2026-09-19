@@ -69,17 +69,54 @@ next starts.
   `ruff check`, `black --check`, and `mypy --strict` all pass clean;
   `pytest` is 9/9 passing (unit + a real testcontainers integration test).
 
-### Phase 2 — SQL features + data validation — Not started
+### Phase 2 — SQL features + data validation — **DONE**
 
-- `sql/features/`: parameterized (`reference_date`) CTE/window-function
-  queries — RFM, tenure buckets, billing trend slope, ticket velocity,
-  payment-failure streaks. Every query documents how it prevents leakage.
-- Migration adding the finalized typed feature columns to
-  `feature_snapshots` (deferred from Phase 1 on purpose — see DECISIONS.md).
-- `sql/validation/`: nulls, duplicates, referential integrity, range
-  checks, class balance, and the point-in-time assertion
-  (`max(event_date) < reference_date` per snapshot).
-- Pandera schema contracts wired to the validation gate.
+- `sql/features/build_feature_snapshot.sql`: one parameterized
+  (`reference_date`, `horizon_days`, `feature_set_version`) query — CTEs,
+  `regr_slope`, `LAG`/`ROW_NUMBER` gaps-and-islands, conditional rolling
+  aggregates — computing RFM, tenure, billing trend, ticket velocity, and
+  payment-failure-streak features, plus the `label_churn_next_30d`
+  target. Every feature CTE filters strictly `< reference_date`; the
+  label deliberately looks forward (see
+  DECISIONS.md#label-lookahead-is-not-leakage).
+- Migration `18765fcc5439` adds 31 typed feature columns +
+  `label_churn_next_30d` to `feature_snapshots` (deferred from Phase 1 on
+  purpose — see DECISIONS.md). Autogenerate missed 3 new CHECK
+  constraints; added by hand and verified by re-running autogenerate
+  until it reported no diff (see
+  DECISIONS.md#autogenerate-misses-check-constraints).
+- `src/churn/features/extract.py` (`extract_feature_snapshot`) and
+  `src/churn/features/build_panel.py` (CLI: `python -m
+  churn.features.build_panel [--force]`) materialize the full monthly
+  panel, idempotently per `(reference_date, feature_set_version)`.
+- `src/churn/features/validation.py`: Pandera schema contracts
+  (`validate_feature_snapshot`, `validate_training_panel`) — the data-
+  validation gate Phase 5's `train.py` will wire in.
+- `sql/validation/`: `nulls_and_duplicates.sql`,
+  `referential_integrity.sql`, `range_checks.sql`, `class_balance.sql`,
+  and `point_in_time_reconciliation.sql` (an adversarial re-check that
+  independently recomputes two aggregates from source tables and diffs
+  them against what's stored).
+- **Verify — all run against the real, fully-loaded database:**
+  - Full 18-month panel materialized: **87,517 rows**, cohort sizes
+    4,573–5,242/month.
+  - `nulls_and_duplicates.sql`, `referential_integrity.sql`,
+    `range_checks.sql`: **zero rows** (clean) on every query.
+  - `point_in_time_reconciliation.sql`: **zero mismatches** across all
+    87,517 rows — independent proof of no leakage, not just an assertion
+    in a comment.
+  - `class_balance.sql`: monthly positive rate **1.27%–2.02%** (panel-wide
+    1.55%), confirming the imbalance predicted in Phase 0/1 — see
+    DECISIONS.md#imbalance-is-designed-in. One caveat found and
+    documented: the very last cohort (`reference_date = SNAPSHOT_DATE`)
+    structurally has 0 positives — a synthetic-data censoring artifact,
+    not a bug (DECISIONS.md#last-cohort-has-a-structural-zero-positive-rate).
+  - 5 new integration tests with hand-crafted fixtures and exact expected
+    values, including a dedicated point-in-time leakage regression test
+    (a billing event dated after `reference_date` that must never be
+    counted) and a brand-new-customer null-handling test.
+  - `ruff`, `black --check`, `mypy --strict`: clean. Full suite: **23/23
+    tests passing**.
 
 ### Phase 3 — Notebooks 01–03 — Not started
 

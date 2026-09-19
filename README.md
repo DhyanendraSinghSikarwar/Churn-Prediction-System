@@ -26,6 +26,7 @@ docker compose up -d postgres pgadmin minio minio-init mlflow
 uv run alembic upgrade head
 
 uv run python -m churn.ingestion.cli
+uv run python -m churn.features.build_panel
 uv run pytest
 ```
 
@@ -45,21 +46,32 @@ Services once `db-up` has run:
 
 ## Status
 
-Phase 1 (infra + DB + ingestion) is complete and was verified end-to-end
-against real Postgres/MLflow/MinIO containers: 7,043 customers loaded,
-zero orphaned foreign keys, idempotent re-run confirmed, `ruff` / `black`
-/ `mypy --strict` clean, 9/9 tests passing. See
-[PLAN.md](PLAN.md) for the full phase breakdown and what's next, and
-[DECISIONS.md](DECISIONS.md#infra-issues-hit-during-verification) for the
-real infra issues that surfaced during verification and how they were
-fixed.
+Phases 1–2 complete, both verified end-to-end against real containers,
+not just written:
+
+- **Phase 1** (infra + DB + ingestion): 7,043 customers loaded, zero
+  orphaned foreign keys, idempotent re-run confirmed. See
+  [DECISIONS.md](DECISIONS.md#infra-issues-hit-during-verification) for
+  the real infra issues hit and fixed along the way.
+- **Phase 2** (SQL features + validation): full 18-month panel
+  materialized (87,517 rows), every validation query clean, an
+  adversarial point-in-time reconciliation check found zero mismatches,
+  and the monthly churn rate came out at 1.27%–2.02% — confirming the
+  imbalance the panel design predicted (see
+  [DECISIONS.md](DECISIONS.md#imbalance-is-designed-in)), with one
+  genuine caveat found and documented (the last cohort's structurally
+  zero positive rate).
+
+`ruff`, `black --check`, `mypy --strict` clean; 23/23 tests passing
+(unit + testcontainers integration). See [PLAN.md](PLAN.md) for the full
+phase breakdown and what's next.
 
 ## Repository layout
 
 ```
 config/       YAML business/pipeline config (no secrets — see .env.example)
-sql/          ddl (generated from Alembic), features (Phase 2), validation (Phase 2)
-src/churn/    the package: config, db, ingestion, and (from Phase 2 on) features/models/...
+sql/          ddl (generated from Alembic), features (extraction queries), validation (data-quality queries)
+src/churn/    the package: config, db, ingestion, features, and (from Phase 4 on) models/evaluation/...
 alembic/      versioned schema migrations — the source of truth for the DB schema
 tests/        unit/ (no Docker needed) and integration/ (testcontainers, needs Docker)
 notebooks/    exploration only — nothing here is imported by src/

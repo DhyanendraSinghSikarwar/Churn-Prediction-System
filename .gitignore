@@ -21,9 +21,10 @@ artifacts/
 # Jupyter
 .ipynb_checkpoints/
 
-# IDE
+# IDE / local tooling state
 .vscode/
 .idea/
+.claude/
 
 # OS
 .DS_Store

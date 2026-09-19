@@ -322,3 +322,134 @@ commands and will work wherever `make` is present (CI, Linux/macOS dev
 machines, WSL). On this machine, Phase 1 was verified by running the
 `uv run ...` / `docker compose ...` commands each target wraps, directly.
 `README.md` notes this for Windows users without `make` installed.
+
+---
+
+## Phase 2 — SQL Features + Data Validation (2026-09-17)
+
+### autogenerate-misses-check-constraints
+
+**Situation:** Added three `CheckConstraint`s to `FeatureSnapshot`
+(`tenure_bucket` enum, `tenure_months >= 0`, `payment_failure_rate_180d`
+range) alongside 31 new columns, then ran
+`alembic revision --autogenerate`. The log showed "Detected added column"
+for all 31 columns but never mentioned the constraints, and the generated
+migration's `upgrade()` had no `create_check_constraint` calls at all.
+
+**Decision:** Caught by re-running `alembic revision --autogenerate`
+immediately after applying the migration and confirming it reported "No
+new upgrade operations detected" — it didn't, the first time, which is
+what surfaced this. Fixed by downgrading one revision, hand-adding the
+three `op.create_check_constraint(...)` calls (and matching
+`op.drop_constraint(...)` in `downgrade()`) to the migration file, then
+re-upgrading and re-checking autogenerate until it reported no diff.
+
+**Why this matters beyond this one migration:** Alembic's autogenerate
+reliably detects added/removed tables, columns, indexes, unique
+constraints, and foreign keys — but not CHECK constraints, at least not
+consistently in this version. Any future migration that adds a
+`CheckConstraint` to a model must be verified the same way: re-run
+autogenerate after applying and confirm it comes back empty. This is now
+also why `sql/ddl/schema.sql`'s header calls this out explicitly, so the
+next person touching the schema doesn't trust autogenerate's silence.
+
+### sqlalchemy-text-rejects-bind-param-postgres-cast
+
+**Situation:** First real run of `build_feature_snapshot.sql` (via
+`pd.read_sql(text(...), conn, params={...})`) failed with
+`psycopg.errors.SyntaxError: syntax error at or near ":"` pointing at
+`:reference_date::date AS reference_date` — caught immediately, on the
+very first execution against real data, not discovered later.
+
+**Decision:** `sqlalchemy.text()`'s bind-parameter tokenizer treats a
+literal `::` immediately after a `:name` token as "leave this alone,
+that's a Postgres cast operator" — but the way it does that also skips
+substituting the bind parameter itself, so `:reference_date::date` was
+sent to psycopg completely unsubstituted, `:` and all. Every occurrence
+of `:reference_date::date` in the query was rewritten to
+`CAST(:reference_date AS date)`. A plain column's own `::type` cast
+(e.g. `br.failed_180d::numeric`) is unaffected — the ambiguity is
+specific to casting a `:name` bind parameter with the shorthand syntax.
+
+**Why note this here:** any future SQL file bound through SQLAlchemy
+`text()` with a Postgres type cast on a parameter must use `CAST(:x AS
+type)`, never `:x::type` — the failure mode is a bare syntax error, not
+a silent wrong answer, so at least it fails loudly rather than leaking.
+
+### last-cohort-has-a-structural-zero-positive-rate
+
+**Situation:** After materializing the full 18-month panel and running
+`sql/validation/class_balance.sql`, every monthly cohort showed a
+positive rate in the 1.3%–2.0% range — exactly the "low single-digit
+percent" the panel design predicted — **except** the very last cohort,
+`reference_date = 2024-06-01` (= `SNAPSHOT_DATE`), which showed exactly
+**0 positives out of 5,174**.
+
+**Why:** this isn't a bug and isn't leakage — it's a censoring artifact
+of the synthetic churn-date generator. `derive_customer_dates()` places
+every churned customer's `churn_date` somewhere in
+`[SNAPSHOT_DATE - 24 months, SNAPSHOT_DATE]` — it can never generate a
+churn date *after* `SNAPSHOT_DATE`, because there's no "after" in this
+synthetic world. So `label_churn_next_30d` for `reference_date =
+SNAPSHOT_DATE` requires a `churn_date` in
+`(SNAPSHOT_DATE, SNAPSHOT_DATE + 30d]`, a range that structurally cannot
+contain any data, by construction. The true underlying churn hazard for
+that cohort is presumably similar to every other month's (~1.5%); the
+observed 0% is an artifact of where the synthetic history happens to end,
+not a real signal.
+
+**Decision:** Documented here rather than silently patched, because the
+right fix depends on what Phase 4 actually wants: either (a) drop the
+last cohort (or more conservatively, the last `horizon_days` worth of
+cohorts) from the usable panel before splitting into train/val/test, or
+(b) keep it but treat it as a known source of mild test-set dilution if
+it lands in the test window. Given the current split (test = last 3
+months = Apr/May/Jun 2024), option (a) is recommended for Phase 4 — using
+`panel_end_date` for materialization but capping the *modeling* panel at
+`SNAPSHOT_DATE - prediction_horizon_days` avoids training or evaluating
+on a cohort whose label is unobservable by construction. Flagging this
+explicitly now so it isn't rediscovered as a mysterious "why is recall
+zero on the last month" bug later.
+
+### feature-selection-vs-feature-extraction-clarified
+
+**Situation:** DECISIONS.md's Phase 1 entry
+`feature_snapshots-schema-staged-across-phases` said the feature set is
+"finalized empirically in notebook 03" — read literally, that could mean
+`feature_snapshots`' columns should keep changing every time notebook 03
+reconsiders a feature, which would make the table's schema hostage to
+notebook experimentation.
+
+**Decision:** Split the concepts. `feature_snapshots` (this migration)
+holds the full *candidate* feature set from `sql/features/build_feature_snapshot.sql`
+— everything in the Phase 0 feature catalog (RFM, tenure, trend/velocity,
+static plan attributes). Notebook 03's job is *selection*: mutual
+information / permutation importance / Boruta / correlation pruning pick
+a *subset* of these columns for a given model iteration to actually
+train on. Selection is recorded as a feature list artifact (Phase 4/5),
+not a schema migration. Ratio/interaction features (Deliverable 4's
+"ratio and interaction features with business rationale") are computed
+in pandas from these base columns in notebook 03, not in SQL — they're
+cheap, leakage-free once the base features are already point-in-time
+correct, and don't need a database round-trip.
+
+### label-lookahead-is-not-leakage
+
+**Situation:** `build_feature_snapshot.sql` (below) computes
+`label_churn_next_30d` by looking at `churn_date` up to
+`reference_date + 30 days` — i.e. *forward* from the feature cutoff. That
+looks, at a glance, like exactly the kind of boundary violation
+DECISIONS.md has spent two phases warning about.
+
+**Decision:** This is intentional and correct, not a leak — documented
+directly in the query's header comment so a future reader doesn't
+"fix" it. The invariant that matters is: no *feature* column may see data
+at or after `reference_date`. The *label* is expected to describe what
+happens after the cutoff — that's the entire premise of supervised
+learning from historical data. The distinction is enforced by keeping
+label computation in a clearly separated final SELECT expression, never
+joined into any feature CTE. In a live production system, this column
+would simply be left NULL until 30 days after the actual scoring date
+(exactly what `predictions.actual_churned` / `label_matured_at` do in
+Phase 6/7); it's always computable here only because this dataset is a
+complete historical replay with the outcome already known.
