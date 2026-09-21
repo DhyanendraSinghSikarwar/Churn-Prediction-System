@@ -46,7 +46,7 @@ Services once `db-up` has run:
 
 ## Status
 
-Phases 1–3 complete, all verified end-to-end against real containers and
+Phases 1–4 complete, all verified end-to-end against real containers and
 real notebook execution, not just written:
 
 - **Phase 1** (infra + DB + ingestion): 7,043 customers loaded, zero
@@ -70,6 +70,17 @@ real notebook execution, not just written:
   procedure / correlation pruning narrowed 44 candidate features to 12
   (see [PLAN.md](PLAN.md#phase-3--notebooks-0103--done)), written to
   `config/selected_features_v1.yaml` for Phase 5.
+- **Phase 4** (notebooks: modelling, evaluation, business impact): an
+  honest result reported as found, not smoothed over — plain
+  `LogisticRegression(class_weight="balanced")` beat every
+  `HistGradientBoostingClassifier` variant tried, tuned or not (test
+  PR-AUC 0.1093 vs. 0.0593); top-decile lift of 4.5x confirms the ranking
+  is real regardless. A cost-based threshold built from the actual
+  retention economics in `config/config.yaml` found the *configured*
+  risk bands would lose money on a real campaign, and a concretely-sized
+  A/B test design shows the safe operating threshold only flags ~16
+  customers/month — a real deployment constraint, not glossed over. See
+  [PLAN.md](PLAN.md#phase-4--notebooks-0406--done) for the full numbers.
 
 `ruff`, `black --check`, `mypy --strict` clean; 23/23 tests passing
 (unit + testcontainers integration). See [PLAN.md](PLAN.md) for the full

@@ -6,7 +6,7 @@ Production-style customer churn prediction system (Postgres → idempotent
 ingestion → SQL feature extraction → training → serving API → monitoring)
 built on the IBM Telco Customer Churn dataset. **Synthetic-data demo** —
 everything with a date on it is a seeded, documented synthetic layer, not
-real telecom events; see DECISIONS.md. Currently Phase 3/8 done — see
+real telecom events; see DECISIONS.md. Currently Phase 4/8 done — see
 PLAN.md for phase status, DECISIONS.md for the why behind every
 non-obvious call.
 
@@ -93,3 +93,14 @@ what each target runs.
 - Docker Desktop does not auto-start on this machine — if `docker compose`
   or a DB connection times out, check `docker info` first and launch
   Docker Desktop if the daemon isn't up.
+- `docker-compose.yml`'s `mlflow` service's `MLFLOW_S3_ENDPOINT_URL` is
+  hardcoded to `http://minio:9000` — never derive it from `${MINIO_ENDPOINT}`
+  (that var is host-facing, `http://localhost:9000`, for code running
+  outside Docker; inside the mlflow container "localhost" means itself,
+  not minio — see DECISIONS.md#mlflow-s3-endpoint-url-must-not-come-from-the-host-facing-env-var).
+- MLflow prints an emoji ("🏃 View run...") on every run completion, which
+  crashes a plain `uv run python -c "..."` script on Windows
+  (`UnicodeEncodeError`, cp1252 console codepage). Doesn't affect notebook
+  execution (nbconvert's kernel protocol is UTF-8); only matters for
+  standalone scripts — write results to a file instead of printing when
+  MLflow output might reach stdout directly.

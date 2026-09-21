@@ -77,7 +77,12 @@ services:
       context: ./docker/mlflow
     restart: unless-stopped
     environment:
-      MLFLOW_S3_ENDPOINT_URL: ${MINIO_ENDPOINT:-http://minio:9000}
+      # Always the in-network service address, never ${MINIO_ENDPOINT} --
+      # that var is host-facing (http://localhost:9000, for Settings.minio_endpoint
+      # used by code running outside Docker) and must not leak into a
+      # container's own view of the network, where "localhost" means the
+      # mlflow container itself, not the minio one.
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
     command: >

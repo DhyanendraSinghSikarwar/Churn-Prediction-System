@@ -181,12 +181,63 @@ next starts.
     and
     [DECISIONS.md#pandas-3-default-string-dtype-breaks-dtype-object-checks](DECISIONS.md#pandas-3-default-string-dtype-breaks-dtype-object-checks).
 
-### Phase 4 — Notebooks 04–06 — Not started
+### Phase 4 — Notebooks 04–06 — **DONE**
 
-- `04_modelling_experiments.ipynb` (baselines → GBMs, time-based CV,
-  Optuna, MLflow logging), `05_evaluation_explainability.ipynb`
-  (PR-AUC-first evaluation, calibration, cost-based threshold, SHAP),
-  `06_business_impact.ipynb` (decile lift, campaign simulation, A/B design).
+- `04_modelling_experiments.ipynb`: time-based train(12mo)/val(3mo)/test
+  split on the modeling panel; baselines (`DummyClassifier(strategy="prior")`,
+  `LogisticRegression(class_weight="balanced")`); an empirical comparison
+  of class weighting vs. SMOTE (`SMOTENC`, categorical-aware) vs. plain,
+  per
+  [DECISIONS.md#imbalance-is-designed-in](DECISIONS.md#imbalance-is-designed-in);
+  Optuna hyperparameter tuning of the winning GBM variant nested inside
+  `GroupKFold(groups=customer_id)` on the training window only; every run
+  logged to MLflow.
+- `05_evaluation_explainability.ipynb`: refits on train+val, evaluates on
+  the untouched test set; PR-AUC-first metrics, calibration (reliability
+  diagram + Brier score), a cost-based decision threshold from
+  `config/config.yaml`'s actual retention economics, and SHAP
+  (`LinearExplainer` for the primary model, `TreeExplainer` for the GBM),
+  including a top-3-features-per-prediction extraction matching
+  `predictions.shap_top3`'s shape for Phase 6.
+- `06_business_impact.ipynb`: decile lift / cumulative gains chart, a
+  4-strategy campaign simulation, a sensitivity grid over the two
+  illustrative economic assumptions, and a concretely-sized A/B test
+  design (power analysis grounded in this model's actual flagging rate).
+- **Verify — all three notebooks executed end-to-end, GBM baseline
+  library switched from the classic `GradientBoostingClassifier` to
+  scikit-learn's `HistGradientBoostingClassifier` mid-phase for tractable
+  Optuna runtimes (see
+  [DECISIONS.md#histgradientboosting-instead-of-classic-gbm](DECISIONS.md#histgradientboosting-instead-of-classic-gbm)):**
+  - **Honest result, reported as found:** plain
+    `LogisticRegression(class_weight="balanced")` beat every GBM variant
+    tried, tuned or not — val PR-AUC **0.1281** vs. the best tuned GBM's
+    **0.0609** (Notebook 04); confirmed on the held-out test set, **0.1093**
+    vs. **0.0593** (Notebook 05). See
+    [DECISIONS.md#logistic-regression-beats-every-gbm-variant](DECISIONS.md#logistic-regression-beats-every-gbm-variant).
+  - SMOTE won among the three GBM imbalance-handling techniques (val
+    PR-AUC 0.0606 vs. 0.0529 plain vs. 0.0483 class-weighted); threshold
+    tuning separately improved the plain GBM's F1 from 0.0077 to 0.0585
+    at the F1-optimal cutoff (0.027).
+  - Test-set decile lift: top decile churns at **7.07%** vs. 1.58%
+    overall — a **4.5x** lift, concrete evidence the ranking is real even
+    though PR-AUC is modest.
+  - Cost-based threshold (from `config.yaml`'s actual retention
+    economics): business-optimal threshold **0.940**, expected value
+    **$1,577** on the test window. At the *configured* `risk_bands`
+    (0.3 / 0.7) the same economics are **strongly net-negative**
+    (-$195,812 / -$48,267) — the default risk bands need recalibrating
+    before Phase 6 uses them for anything real.
+  - A/B test design: at the business-optimal threshold the model flags
+    only ~16 customers/month, so a properly powered randomized trial
+    (1,089/arm) would take **~137 months** to accumulate — a genuine,
+    unglamorous finding about this specific model/threshold combination,
+    not glossed over.
+  - A real Docker networking bug was found and fixed along the way (MLflow
+    couldn't reach MinIO to log artifacts) — see
+    [DECISIONS.md#mlflow-s3-endpoint-url-must-not-come-from-the-host-facing-env-var](DECISIONS.md#mlflow-s3-endpoint-url-must-not-come-from-the-host-facing-env-var).
+  - Notebook hygiene checked (claude-kit `jupyter-hygiene`): no secrets,
+    `execution_count` runs 1..n in every notebook, every source of
+    randomness seeded. Outputs kept, same rationale as Phase 3.
 
 ### Phase 5 — Training pipeline + registry — Not started
 

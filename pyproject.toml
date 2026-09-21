@@ -52,6 +52,9 @@ notebooks = [
     "seaborn>=0.13.2",
     "scikit-learn>=1.4.2",
     "imbalanced-learn>=0.12.2",
+    "mlflow>=3.16.1",
+    "optuna>=5.0.0",
+    "shap>=0.51.0",
 ]
 
 [build-system]

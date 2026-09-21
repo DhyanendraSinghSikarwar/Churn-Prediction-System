@@ -579,3 +579,149 @@ trusting Phase 2's SQL) is exactly the kind of measurement this project
 insists on before making a call — dropping more cohorts than the data
 shows is affected would throw away real, usable training signal for no
 benefit.
+
+---
+
+## Phase 4 — Notebooks 04-06: Modelling, Evaluation, Business Impact (2026-09-21)
+
+### mlflow-s3-endpoint-url-must-not-come-from-the-host-facing-env-var
+
+**Situation:** The first `mlflow.log_artifact()` call in Notebook 04
+failed with `botocore.exceptions.EndpointConnectionError: Could not
+connect to the endpoint URL: "http://localhost:9000/..."` — the MLflow
+server container itself was trying to reach MinIO at `localhost:9000`.
+
+**Decision:** `docker-compose.yml`'s `mlflow` service set
+`MLFLOW_S3_ENDPOINT_URL: ${MINIO_ENDPOINT:-http://minio:9000}` — reading
+the *same* `MINIO_ENDPOINT` variable `.env` sets to `http://localhost:9000`
+for host-side code (`Settings.minio_endpoint`, used by anything running
+outside Docker, since MinIO's ports are published to the host). Because
+`.env` always sets that variable, the compose default never took effect,
+and the mlflow container inherited a `localhost` that — from inside its
+own network namespace — means the mlflow container itself, not the minio
+one. Fixed by hardcoding `MLFLOW_S3_ENDPOINT_URL: http://minio:9000`
+directly in `docker-compose.yml`, with no `${MINIO_ENDPOINT}` indirection
+at all: this value is never host-configurable, so it should never have
+been sourced from a host-facing variable.
+
+**Rejected alternative:** renaming `MINIO_ENDPOINT` everywhere to force
+docker-compose to use its own default. Rejected because the simpler fix
+(hardcode the one value that's genuinely fixed) removes the variable
+collision entirely instead of relying on nobody accidentally setting
+`.env`'s `MINIO_ENDPOINT` again in the future.
+
+**Why this matters beyond this one bug:** any container-internal
+Docker-network address must never be sourced from a host-facing `.env`
+variable of the same apparent purpose — the two are only coincidentally
+related (same physical service, different network vantage points), and
+`.env`'s existence as "the" config source makes it tempting to reuse
+across both. This had been latent since Phase 1's `docker-compose.yml`
+was written; it just never got exercised until Phase 4 actually called
+`mlflow.log_artifact()`.
+
+### histgradientboosting-instead-of-classic-gbm
+
+**Situation:** Notebook 04's first real run (`GradientBoostingClassifier`,
+scikit-learn's classic exact-split boosting) hit nbconvert's cell timeout
+(1500s) partway through the 25-trial Optuna search on a ~66k-row training
+fold — the exact-split algorithm doesn't scale well to that row count
+repeated across dozens of hyperparameter trials.
+
+**Decision:** Switched to `HistGradientBoostingClassifier`
+(scikit-learn's native histogram-based boosting, LightGBM-style binned
+splits) — same library, no new dependency, dramatically faster on this
+data size. Hyperparameter names differ (`max_iter` instead of
+`n_estimators`, no `subsample`, added `l2_regularization`); the search
+space and technique-comparison code were updated accordingly. Also
+reduced the Optuna search itself (25→12 trials, 3→2 `GroupKFold` splits)
+after the identical, seeded computation still occasionally exceeded the
+timeout on a second run — attributed to this dev machine's variable
+background load (OneDrive sync, Docker Desktop), not the code.
+
+**Rejected alternative:** adding `xgboost` or `lightgbm`. Rejected for
+the same reason Boruta was hand-rolled in Phase 3 instead of pulling in
+the unmaintained `boruta` package — a built-in, adequate tool beats a new
+dependency when one is available.
+
+### logistic-regression-beats-every-gbm-variant
+
+**Situation:** Notebook 04 was built expecting the GBM (with imbalance
+handling and Optuna tuning) to be the strongest candidate — the baseline
+logistic regression was meant to be a reference point, not the winner.
+
+**Decision:** Reported the actual result instead of re-framing the
+notebook around it after the fact. `LogisticRegression(class_weight="balanced")`
+scored val PR-AUC 0.1281; the best GBM variant (SMOTE, Optuna-tuned)
+scored 0.0609 — logistic regression wins by a wide margin, confirmed
+again on the untouched test set in Notebook 05 (0.1093 vs. 0.0593).
+Notebook 04's summary cell explicitly flags this ("the GBM line of
+experiments never beat the logistic regression baseline... reported as
+found, not smoothed over") rather than quietly making the GBM the
+headline model. Notebook 05/06 evaluate the logistic regression as the
+primary model and carry the tuned GBM alongside only for completeness.
+
+**Why this is a real result, not a bug:** only 12 selected features (7
+low-cardinality categoricals contributing little nonlinear structure),
+~1.7% positive rate in training, and none of Notebook 03's engineered
+interaction features survived selection — exactly the regime where a
+well-regularized linear model's lower variance tends to beat a boosted
+ensemble's extra flexibility. Same principle as Notebook 03's engineered
+features not making the final cut: an honest empirical result is worth
+more than a result that matches what was expected going in.
+
+### ltv-proxy-and-cost-based-threshold-formula
+
+**Situation:** `config/config.yaml`'s `business:` block gives
+`retention_offer_cost`, `assumed_ltv_horizon_months`, and
+`offer_success_rate`, but no actual customer LTV figure — the dataset has
+no real economics in it (PLAN.md's confirmed assumptions).
+
+**Decision:** LTV proxy per customer = `monthly_charges *
+assumed_ltv_horizon_months` (Notebook 05/06). Expected value of flagging
+a customer counts only the *incremental* effect of making an offer: a
+true positive nets `offer_success_rate * LTV - retention_offer_cost`
+(the offer costs money whether or not it succeeds, but only pays off on
+success); a false positive costs `-retention_offer_cost` with no offset;
+true negatives and false negatives are exactly $0 (no offer made, so
+nothing attributed to inaction).
+
+**Rejected alternative:** counting false negatives as a "cost" equal to
+the LTV lost. Rejected because that would be scoring the whole portfolio,
+not the incremental value of *this specific intervention* — the question
+this notebook actually needs to answer is "should we make this offer,"
+not "what is our total exposure to churn," and conflating the two would
+make every threshold look artificially better than contact-no-one, which
+defeats the point of the comparison.
+
+**Finding this formula produced, not assumed:** at the *configured*
+`risk_bands` (0.3 / 0.7), this formula returns a strongly negative
+expected value on the test set — false-positive cost dominates unless the
+threshold is set near the top of the probability range (the actual
+business-optimal threshold came out to 0.940). This is a legitimate
+consequence of a ~1.6% base rate combined with a flat per-contact cost,
+not an error in the formula; see PLAN.md Phase 4 for the concrete
+numbers and DECISIONS.md's `logistic-regression-beats-every-gbm-variant`
+entry for why the model's PR-AUC is modest to begin with.
+
+### windows-emoji-console-encoding-breaks-plain-script-runs
+
+**Situation:** A standalone `uv run python -c "..."` MLflow smoke test
+crashed with `UnicodeEncodeError: 'charmap' codec can't encode character
+'\U0001f3c3'` — MLflow prints a "🏃 View run..." message on every run
+completion, and Windows' default console codepage (cp1252) can't encode
+it.
+
+**Decision:** Documented as environment-specific, not fixed in project
+code — this never affects the actual notebooks (nbconvert communicates
+with the kernel over the Jupyter message protocol, which is UTF-8
+regardless of the host console's codepage), only ad hoc scripts run
+directly in a Windows console. No project code prints emoji, so nothing
+here needed changing; noted in CLAUDE.md's gotchas so a future direct
+script invocation that hits this isn't mistaken for a real bug.
+
+**Why not set `PYTHONIOENCODING=utf-8` globally:** it would paper over
+the same failure mode for every future direct script run instead of
+recognizing it as specific to this one interaction (Windows console +
+emoji-printing library) — cheaper to know the shape of the problem than
+to blanket-fix an entire class of encoding issues that mostly won't
+recur.
