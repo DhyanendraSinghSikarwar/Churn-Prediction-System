@@ -46,8 +46,8 @@ Services once `db-up` has run:
 
 ## Status
 
-Phases 1–2 complete, both verified end-to-end against real containers,
-not just written:
+Phases 1–3 complete, all verified end-to-end against real containers and
+real notebook execution, not just written:
 
 - **Phase 1** (infra + DB + ingestion): 7,043 customers loaded, zero
   orphaned foreign keys, idempotent re-run confirmed. See
@@ -61,6 +61,15 @@ not just written:
   [DECISIONS.md](DECISIONS.md#imbalance-is-designed-in)), with one
   genuine caveat found and documented (the last cohort's structurally
   zero positive rate).
+- **Phase 3** (notebooks: data audit, EDA, feature selection): the
+  synthetic generator's statistical assumptions (payment-failure rates,
+  the pre-churn ticket-velocity spike) confirmed empirically against the
+  loaded data, not just trusted from the code; a second, independent
+  leakage audit (0 mismatches across 80,968 tenure-trajectory checks);
+  mutual information / permutation importance / a hand-rolled Boruta
+  procedure / correlation pruning narrowed 44 candidate features to 12
+  (see [PLAN.md](PLAN.md#phase-3--notebooks-0103--done)), written to
+  `config/selected_features_v1.yaml` for Phase 5.
 
 `ruff`, `black --check`, `mypy --strict` clean; 23/23 tests passing
 (unit + testcontainers integration). See [PLAN.md](PLAN.md) for the full

@@ -118,11 +118,68 @@ next starts.
   - `ruff`, `black --check`, `mypy --strict`: clean. Full suite: **23/23
     tests passing**.
 
-### Phase 3 — Notebooks 01–03 — Not started
+### Phase 3 — Notebooks 01–03 — **DONE**
 
-- `01_data_audit.ipynb`, `02_eda_statistics.ipynb`,
-  `03_feature_engineering.ipynb`. Empirical confirmation of the panel's
-  class imbalance, leakage audit, feature selection.
+- `01_data_audit.ipynb`: independent pandas-side audit of the raw CSV and
+  the synthetic temporal layer against `config/config.yaml`'s documented
+  generator assumptions — distinct from `sql/validation/*.sql` (which
+  checks internal DB consistency, not "does the generator behave as
+  documented").
+- `02_eda_statistics.ipynb`: empirically confirms the panel's class
+  imbalance (re-measured independently in pandas, not just trusted from
+  Phase 2's SQL), a leakage audit independent of
+  `point_in_time_reconciliation.sql`, univariate/bivariate EDA, and
+  mutual-information/chi²/Mann-Whitney statistical tests.
+- `03_feature_engineering.ipynb`: 5 ratio/interaction features with
+  explicit business rationale; feature *selection* via mutual information,
+  permutation importance, a hand-rolled Boruta shadow-feature procedure
+  (see
+  [DECISIONS.md#hand-rolled-boruta-instead-of-the-boruta-package](DECISIONS.md#hand-rolled-boruta-instead-of-the-boruta-package)),
+  and Spearman correlation pruning — selected subset written to
+  `config/selected_features_v1.yaml` for Phase 5 to consume (see
+  DECISIONS.md#feature-selection-vs-feature-extraction-clarified).
+- **Verify — all three notebooks executed end-to-end against the real,
+  fully-loaded database, not hand-typed:**
+  - Notebook 01: raw-CSV audit found one known, harmless quirk (11 blank
+    `TotalCharges` rows, all `tenure == 0`, irrelevant since the column is
+    dropped at ingestion); `customers` confirmed an exact carry-through of
+    the raw CSV; `signup_date`/`churn_date` placement confirmed consistent
+    with each customer's raw tenure; churn-date lookback confirmed
+    consistent with the documented uniform-over-24-months placement (KS
+    test p=0.11); empirical payment-failure rates matched the configured
+    per-segment formula within sampling noise in every segment; the
+    pre-churn ticket-velocity spike was empirically measured at **2.30×**
+    (configured: 2.5×).
+  - Notebook 02: panel-wide positive rate **1.55%**, matching Phase 2's
+    SQL figure exactly; leakage audit clean — 0 mismatches across 80,968
+    consecutive-row tenure-trajectory checks, brand-new customers
+    confirmed to show zero recent-charge history on their first snapshot,
+    no single feature dominates the label's mutual information; 28/33
+    candidate features significant at α=0.01.
+  - Notebook 03: dropped the structurally-censored `reference_date ==
+    SNAPSHOT_DATE` cohort (5,174 rows) per
+    [DECISIONS.md#last-cohort-has-a-structural-zero-positive-rate](DECISIONS.md#last-cohort-has-a-structural-zero-positive-rate),
+    leaving an 82,343-row modeling panel; baseline RandomForest (grouped
+    train/val split, no customer in both) scored **PR-AUC 0.1184** vs. a
+    0.0169 random-guess baseline; Boruta: 27 confirmed / 3 tentative / 14
+    rejected; 12/44 candidate features selected by ≥2-of-3 majority vote
+    (none of the 5 engineered ratio/interaction features made the cut —
+    an honest empirical result, not an error: the raw RFM/categorical
+    features carried more independent signal by all three methods).
+  - `ruff`, `black --check`, `mypy --strict` on `src`/`tests`: unaffected
+    (this phase touched only `notebooks/` and added
+    `config/selected_features_v1.yaml`).
+  - Notebook hygiene checked (claude-kit `jupyter-hygiene`): no secrets in
+    outputs, `execution_count` runs 1..n in every notebook, all randomness
+    seeded from `cfg.synthetic.random_seed`. Outputs were kept (not
+    stripped) — these notebooks are this phase's evidence, in the same
+    spirit as Phase 1/2's verify sections; `nbstripout` remains a Phase 8
+    item per DECISIONS.md's `tech-stack` entry, not forgotten.
+  - Two real environment bugs found and fixed during this phase, not
+    swept under the rug — see
+    [DECISIONS.md#nbconvert-cwd-breaks-env-file-resolution](DECISIONS.md#nbconvert-cwd-breaks-env-file-resolution)
+    and
+    [DECISIONS.md#pandas-3-default-string-dtype-breaks-dtype-object-checks](DECISIONS.md#pandas-3-default-string-dtype-breaks-dtype-object-checks).
 
 ### Phase 4 — Notebooks 04–06 — Not started
 

@@ -453,3 +453,129 @@ would simply be left NULL until 30 days after the actual scoring date
 (exactly what `predictions.actual_churned` / `label_matured_at` do in
 Phase 6/7); it's always computable here only because this dataset is a
 complete historical replay with the outcome already known.
+
+---
+
+## Phase 3 — Notebooks 01-03: Data Audit, EDA, Feature Selection (2026-09-21)
+
+### nbconvert-cwd-breaks-env-file-resolution
+
+**Situation:** All three notebooks failed on their first automated
+(`jupyter nbconvert --execute`) run with `psycopg.OperationalError:
+fe_sendauth: no password supplied` — not a missing-file error, a silent
+empty password.
+
+**Decision:** `nbconvert` executes a notebook with the working directory
+set to the notebook's own folder (`notebooks/`), but `Settings`
+(`src/churn/config.py`) resolves `pydantic-settings`' `env_file=".env"`
+relative to the process's current working directory, not the project
+root. From `notebooks/`, that path silently misses `.env` — `pydantic-settings`
+treats a missing env file as "no overrides" rather than an error, so every
+field quietly falls back to its class default, including
+`db_password: str = ""`. Every notebook's setup cell now does
+`os.chdir(PROJECT_ROOT)` (computed from `churn.config.PROJECT_ROOT`, which
+is itself cwd-independent) immediately after importing config, before
+calling `get_settings()`/`get_engine()`.
+
+**Rejected alternative:** hardcoding an absolute `.env` path into
+`Settings.model_config`. Rejected because it would only fix the
+notebook-from-a-different-cwd case and would break the documented
+`uv run ...` workflow (always invoked from the project root) if `.env`
+ever moved.
+
+**Why this matters beyond notebooks:** any future script invoked with a
+cwd other than the project root (a cron job, a CI step, a Prefect
+deployment default working directory) hits the exact same silent
+failure — worth remembering before assuming "it works when I run it" means
+it will work everywhere.
+
+### pandas-3-default-string-dtype-breaks-dtype-object-checks
+
+**Situation:** `uv sync --group notebooks` resolved `pandas==3.0.5`
+(`pyproject.toml` only pins the `>=2.2.1` floor). Notebook 02's
+mutual-information cell crashed with
+`ValueError: could not convert string to float: 'One year'` —
+`contract_type` had been silently classified as a *numeric* column.
+
+**Decision:** pandas 3.0 changed the default in-memory representation of
+string columns from plain `object` dtype to a dedicated `str`/`string`
+dtype (confirmed directly: notebook 01's own `df.info()` reports
+`Dtype: str` for every text column, not `object`). Code written against
+the pandas-2-era idiom `df[c].dtype == object` to detect categorical
+columns silently stops matching string columns under pandas 3 — they fall
+through into whatever branch handles "everything else," here treated as
+numeric. Fixed in both notebooks 02 and 03 by classifying columns with
+`pd.api.types.is_numeric_dtype(...) and not pd.api.types.is_bool_dtype(...)`
+instead, which is correct regardless of which dtype backend a given pandas
+version uses for strings.
+
+**Rejected alternative:** pinning `pandas<3` in `pyproject.toml`. Rejected
+here — the fix is one line more robust and forward-compatible, and pinning
+would just defer the same bug to whenever the project does upgrade.
+Flagged as worth a deliberate, tested pandas-3 compatibility pass across
+`src/churn` before Phase 5 trains anything real, since this exact pattern
+(`dtype == object`) is a natural one to have used elsewhere.
+
+### hand-rolled-boruta-instead-of-the-boruta-package
+
+**Situation:** Feature selection (Deliverable 4) explicitly calls for
+Boruta among the four selection methods. The `boruta` / `BorutaPy` PyPI
+package is unmaintained (last release ~2020) and known to break against
+scikit-learn >= 1.3's API.
+
+**Decision:** Hand-rolled the core Boruta algorithm directly in notebook
+03 (`boruta_shadow_selection()`): shuffle every real feature into a
+same-distribution "shadow" copy each iteration, fit a random forest on
+real+shadow together, tally how often each real feature's importance
+beats the *best* shadow feature's, and binomial-test the win rate against
+chance to classify confirmed/tentative/rejected. ~30 lines, fully
+inline and inspectable.
+
+**Rejected alternative:** the `boruta` package, or skipping Boruta
+entirely and only reporting 3 of the 4 required methods. Rejected for the
+same reason DECISIONS.md's Phase 0 `tech-stack` entry rejected `evidently`
+for drift statistics: the core idea is simple enough to hand-roll, and a
+fragile, unmaintained dependency is worse than 30 lines of plain
+scikit-learn/scipy this project already depends on.
+
+### feature-list-artifact-lives-in-config-not-artifacts
+
+**Situation:** DECISIONS.md's Phase 1 entry
+(`feature-selection-vs-feature-extraction-clarified`) said selection
+would be "recorded as a feature list artifact," without saying where.
+`artifacts/` looks like the obvious name but is git-ignored (`.gitignore`:
+"trained model artifacts live in MLflow/MinIO, not in git").
+
+**Decision:** Notebook 03 writes `config/selected_features_v1.yaml` —
+alongside `config/config.yaml`, following the same "committed,
+human-reviewable, safe (no secrets)" pattern, since Phase 5's `train.py`
+needs to read this file deterministically on every run, not regenerate it
+from `artifacts/` (which may not exist in a fresh clone or CI checkout).
+
+**Rejected alternative:** un-ignoring a specific path under `artifacts/`.
+Rejected because it would mix a small, reviewable, version-controlled
+config value into a directory whose entire purpose is to hold large,
+regenerable, git-ignored outputs — exactly the kind of category mix the
+`config/` vs `artifacts/` split exists to prevent.
+
+### last-cohort-dropped-from-modeling-panel
+
+**Situation:** Phase 2's `last-cohort-has-a-structural-zero-positive-rate`
+entry left the choice open between two options for Phase 3/4: drop just
+the single `reference_date == SNAPSHOT_DATE` cohort, or more
+conservatively drop the last `horizon_days` worth of cohorts.
+
+**Decision:** Notebook 02 independently re-confirmed, in pandas, that
+*only* the single last cohort has the structural zero (every other
+cohort's positive rate falls in the same 1.3-2.0% band predicted since
+Phase 0) — so notebook 03 drops exactly that one cohort (5,174 of 87,517
+rows) before doing any feature selection or, later, any modeling. The
+`feature_snapshots` table itself is untouched; this is a modeling-panel
+filter, applied fresh in every notebook/pipeline step that trains or
+evaluates, not a data deletion.
+
+**Why the less conservative option:** the empirical re-check (not just
+trusting Phase 2's SQL) is exactly the kind of measurement this project
+insists on before making a call — dropping more cohorts than the data
+shows is affected would throw away real, usable training signal for no
+benefit.

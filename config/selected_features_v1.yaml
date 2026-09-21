@@ -1,0 +1,34 @@
+feature_set_version: v1
+generated_by: notebooks/03_feature_engineering.ipynb
+selection_rule: '>=2 of {top-15 mutual information, top-15 permutation importance,
+  Boruta confirmed/tentative}, excluding the lower-MI half of any |Spearman r|>0.8
+  pair'
+modeling_panel_note: Excludes reference_date == SNAPSHOT_DATE cohort (structural zero-positive-rate
+  censoring artifact).
+n_candidate_features: 44
+n_selected: 12
+selected_features:
+- contract_type
+- online_security
+- tech_support
+- tenure_months
+- tenure_bucket
+- frequency_charges_90d
+- frequency_tickets_30d
+- frequency_tickets_90d
+- internet_service
+- online_backup
+- payment_method
+- monetary_charges_90d
+engineered_features_included: []
+correlation_pruned:
+- billing_amount_slope_90d
+- charge_per_tenure_month
+- cumulative_charges_to_date
+- frequency_charges_60d
+- frequency_tickets_60d
+- monetary_charges_30d
+- monetary_charges_60d
+- monthly_charges
+- recency_days_since_last_ticket
+- ticket_velocity_ratio_30_90

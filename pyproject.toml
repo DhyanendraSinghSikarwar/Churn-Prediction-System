@@ -37,6 +37,22 @@ dev = [
     "testcontainers[postgres]>=4.4.0",
     "types-python-dateutil>=2.9.0.20260807",
 ]
+# Exploration-only: nothing under src/churn imports these yet. Kept apart
+# from `dependencies` per DECISIONS.md ("add dependencies per-phase
+# rather than front-loading the whole stack") — scikit-learn etc. move to
+# `dependencies` once src/churn/models actually imports them (Phase 4/5).
+notebooks = [
+    "jupyter>=1.0.0",
+    "nbconvert>=7.16.3",
+    "ipykernel>=6.29.4",
+    "scipy>=1.13.0",
+    "statsmodels>=0.14.1",
+    "lifelines>=0.29.0",
+    "matplotlib>=3.8.4",
+    "seaborn>=0.13.2",
+    "scikit-learn>=1.4.2",
+    "imbalanced-learn>=0.12.2",
+]
 
 [build-system]
 requires = ["hatchling"]
