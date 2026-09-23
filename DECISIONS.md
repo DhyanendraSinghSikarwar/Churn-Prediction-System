@@ -725,3 +725,73 @@ recognizing it as specific to this one interaction (Windows console +
 emoji-printing library) — cheaper to know the shape of the problem than
 to blanket-fix an entire class of encoding issues that mostly won't
 recur.
+
+---
+
+## Phase 4 post-review fixes (2026-09-23)
+
+Phase 4 was reviewed by a fresh agent (no prior context, briefed to be
+adversarial rather than confirm the work) before Phase 5 started. It
+found one real bug and two minor issues, all fixed below; everything
+else it checked — no leakage, `GroupKFold` usage, the cost-based
+threshold arithmetic, the A/B sample-size calculation, and every other
+headline number — came back clean.
+
+### shared-columntransformer-corrupted-notebook-04s-threshold-tuning-numbers
+
+**Situation:** Notebook 04's imbalance-technique comparison
+(`gbm_plain`, `gbm_classweight`, `gbm_smote`) and the later threshold-tuning
+cell all referenced *one* `ColumnTransformer` instance. sklearn's
+`Pipeline` does not clone its steps — fitting `gbm_smote` (whose SMOTENC
+step resamples the training data before the shared preprocessor refits on
+it) silently left `gbm_plain`'s already-fitted preprocessor rescaled to
+the *resampled* distribution. The technique-comparison PR-AUCs (0.0529 /
+0.0483 / 0.0606) were unaffected — each was computed by an immediate
+fit-then-predict before any other pipeline touched the shared object —
+but the threshold-tuning cell called `gbm_plain.predict_proba(X_val)` a
+*second* time, after `gbm_smote.fit()` had already corrupted the shared
+preprocessor. That produced wrong probabilities, and from them a wrong
+F1 curve: the notebook (and PLAN.md, copying it) reported F1 0.0077 →
+0.0585 at threshold 0.027, when the correct values — reproduced and
+confirmed by the reviewing agent, then by re-running the fixed notebook —
+are F1 0.0229 → 0.1183 at threshold 0.096.
+
+**Decision:** Every pipeline in Notebook 04 now gets its own
+`ColumnTransformer` from a `make_preprocessor()` factory — the exact
+pattern Notebooks 05 and 06 already used correctly (their own comment
+even flagged this as "a real bug caught before this ran," just never
+backported to 04). Also split the three-fit technique-comparison cell
+into one cell per technique, so a future slow or hung fit is visible on
+its own rather than inside one large multi-fit cell.
+
+**Why this matters beyond this one notebook:** any two `Pipeline` (or
+`ImbPipeline`) objects built by literally passing the same transformer
+instance into both are unsafe unless it is provably never refit twice —
+which is easy to get right the first time a model is built and easy to
+break the moment a second one is added next to it "for comparison."
+Phase 5's `train.py` must build a fresh preprocessor per fitted pipeline,
+never share one across candidate models.
+
+### groupkfold-cv-score-is-not-comparable-to-forward-in-time-pr-auc
+
+**Situation:** Notebook 04's Optuna search reported a `GroupKFold`
+cross-validation PR-AUC of 0.1101 for the tuned SMOTE+GBM — noticeably
+higher than that same model's forward-in-time validation PR-AUC (0.0609)
+and test PR-AUC (0.0593).
+
+**Decision:** Documented, not "fixed" — there's nothing wrong with either
+number, they measure different things. `GroupKFold(groups=customer_id)`
+prevents a customer appearing in both a fold's train and validation
+split, but it does not block train, so the CV score is a same-training-window,
+contemporaneous estimate; the val/test PR-AUCs are strictly forward-in-time
+(later calendar months the model never saw). The gap is expected, not a
+sign of a leak or a bug.
+
+**Why this matters for Phase 5:** the training pipeline's promotion gate
+("beat the current Production model's PR-AUC by at least
+`promotion_epsilon`," per `config/config.yaml`) must compare like with
+like — a candidate's forward-in-time validation/test PR-AUC against
+Production's own forward-in-time PR-AUC, never a candidate's CV score
+against Production's deployed metric. Comparing a CV number against a
+forward-in-time number would make every candidate look better than it
+is and risk promoting a model that doesn't actually generalize forward.

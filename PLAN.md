@@ -16,7 +16,14 @@ next starts.
 
 - `SNAPSHOT_DATE = 2024-06-01` — the fixed "today" of the synthetic world.
 - Monthly scoring panel spans 18 cohorts, `2023-01-01` … `2024-06-01`:
-  train = first 12 months, validation = next 3, test = last 3.
+  train = first 12 months, validation = next 3, test = last 3 **as
+  materialized**. The *modeling* panel used from Phase 3 on drops the
+  structurally-censored last cohort (see
+  [DECISIONS.md#last-cohort-dropped-from-modeling-panel](DECISIONS.md#last-cohort-dropped-from-modeling-panel)),
+  so in every notebook from Phase 4 on, test is actually the last **2**
+  cohorts (`2024-04-01`/`2024-05-01`, 10,328 rows) — this was flagged in
+  Notebook 04's own markdown at the time but not reflected here until
+  now.
 - Prediction target: `churn_next_30d` — will the customer churn within 30
   days of `reference_date`.
 - Orchestrator: Prefect 2 (see DECISIONS.md — orchestrator-choice).
@@ -216,8 +223,9 @@ next starts.
     [DECISIONS.md#logistic-regression-beats-every-gbm-variant](DECISIONS.md#logistic-regression-beats-every-gbm-variant).
   - SMOTE won among the three GBM imbalance-handling techniques (val
     PR-AUC 0.0606 vs. 0.0529 plain vs. 0.0483 class-weighted); threshold
-    tuning separately improved the plain GBM's F1 from 0.0077 to 0.0585
-    at the F1-optimal cutoff (0.027).
+    tuning separately improved the plain GBM's F1 from 0.0229 to 0.1183
+    at the F1-optimal cutoff (0.096). (A post-review correction — see
+    [DECISIONS.md#shared-columntransformer-corrupted-notebook-04s-threshold-tuning-numbers](DECISIONS.md#shared-columntransformer-corrupted-notebook-04s-threshold-tuning-numbers).)
   - Test-set decile lift: top decile churns at **7.07%** vs. 1.58%
     overall — a **4.5x** lift, concrete evidence the ranking is real even
     though PR-AUC is modest.
@@ -238,6 +246,16 @@ next starts.
   - Notebook hygiene checked (claude-kit `jupyter-hygiene`): no secrets,
     `execution_count` runs 1..n in every notebook, every source of
     randomness seeded. Outputs kept, same rationale as Phase 3.
+  - Independently reviewed post-hoc (a fresh agent, no prior context,
+    briefed to be adversarial) before Phase 5 started: found and this
+    project fixed one real correctness bug — see
+    [DECISIONS.md#shared-columntransformer-corrupted-notebook-04s-threshold-tuning-numbers](DECISIONS.md#shared-columntransformer-corrupted-notebook-04s-threshold-tuning-numbers)
+    — plus a dead conditional in Notebook 05's risk-band finding (fixed)
+    and a minor LTV double-counting caveat in Notebook 06's illustrative
+    comparison rows (documented, doesn't affect the reported strategy).
+    Confirmed clean: no leakage, correct `GroupKFold` usage, the
+    cost-based-threshold arithmetic, the A/B sample-size calculation, and
+    every other headline number in this section.
 
 ### Phase 5 — Training pipeline + registry — Not started
 
