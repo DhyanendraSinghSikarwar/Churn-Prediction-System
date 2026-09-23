@@ -6,7 +6,7 @@ Production-style customer churn prediction system (Postgres → idempotent
 ingestion → SQL feature extraction → training → serving API → monitoring)
 built on the IBM Telco Customer Churn dataset. **Synthetic-data demo** —
 everything with a date on it is a seeded, documented synthetic layer, not
-real telecom events; see DECISIONS.md. Currently Phase 4/8 done — see
+real telecom events; see DECISIONS.md. Currently Phase 5/8 done — see
 PLAN.md for phase status, DECISIONS.md for the why behind every
 non-obvious call.
 
@@ -14,10 +14,11 @@ non-obvious call.
 
 ```bash
 uv sync && uv run pre-commit install                    # setup
-uv sync --group notebooks                                 # + jupyter/sklearn/etc (Phase 3+)
+uv sync --group notebooks                                 # + jupyter/EDA-only libs (Phase 3+)
 docker compose up -d postgres pgadmin minio minio-init mlflow
 uv run alembic upgrade head                              # db up + migrate
 uv run python -m churn.ingestion.cli                      # ingest
+uv run python pipelines/train.py                          # train + register (Phase 5)
 uv run pytest                                             # full suite (needs Docker)
 uv run pytest tests/unit                                  # unit only, no Docker
 uv run ruff check src tests && uv run black --check src tests && uv run mypy src   # lint
@@ -36,7 +37,13 @@ what each target runs.
   hidden behind an ORM query layer (deliberate, so window-function SQL
   stays reviewable — DECISIONS.md#tech-stack).
 - `notebooks/` — exploration only; nothing under `src/churn` imports from it.
-- `pipelines/`, `api/`, `dashboards/` — scaffolded, not yet built (Phase 5–7).
+- `src/churn/models/` — `split.py`/`pipeline.py`/`registry.py`: the single
+  source of truth for the train/val/test split, the preprocessing+model
+  `Pipeline` builder, and MLflow registry helpers. `pipelines/train.py`
+  and any future notebook/pipeline must reuse these, never re-implement
+  them inline — that duplication is exactly what caused Phase 4's
+  shared-`ColumnTransformer` bug (DECISIONS.md).
+- `api/`, `dashboards/` — scaffolded, not yet built (Phase 6–7).
 
 ## Conventions
 
@@ -99,8 +106,21 @@ what each target runs.
   outside Docker; inside the mlflow container "localhost" means itself,
   not minio — see DECISIONS.md#mlflow-s3-endpoint-url-must-not-come-from-the-host-facing-env-var).
 - MLflow prints an emoji ("🏃 View run...") on every run completion, which
-  crashes a plain `uv run python -c "..."` script on Windows
-  (`UnicodeEncodeError`, cp1252 console codepage). Doesn't affect notebook
-  execution (nbconvert's kernel protocol is UTF-8); only matters for
-  standalone scripts — write results to a file instead of printing when
-  MLflow output might reach stdout directly.
+  crashes a plain console script on Windows (`UnicodeEncodeError`, cp1252
+  codepage) — doesn't affect notebooks (nbconvert's kernel protocol is
+  UTF-8) but does affect any real script, including `pipelines/train.py`
+  (which fixes it via `sys.stdout.reconfigure(encoding="utf-8", ...)` in
+  `main()`, before mlflow prints anything — copy that pattern in any new
+  script that touches mlflow directly).
+- This project's mlflow *client* (3.x, latest at install time) is newer
+  than the Docker mlflow *server* (pinned to 2.14.1). `mlflow.sklearn.log_model()`
+  always fails against it (404 on mlflow 3's new "Logged Model" API,
+  which 2.14.1 doesn't have) — use
+  `churn.models.registry.log_pipeline_artifact()` instead
+  (`save_model()` locally + `log_artifacts()` upload), and use the alias
+  API (`set_registered_model_alias`/`get_model_version_by_alias`), not
+  the deprecated stages API — see
+  DECISIONS.md#mlflow-client-3x-vs-server-2x-model-logging-incompatibility.
+- `sklearn`/`mlflow` ship no `py.typed` marker — both need a
+  `[[tool.mypy.overrides]] ignore_missing_imports = true` entry (already
+  added); a new untyped ML dependency will need the same treatment.

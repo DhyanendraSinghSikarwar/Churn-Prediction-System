@@ -21,6 +21,8 @@ dependencies = [
     "requests>=2.31.0",
     "tqdm>=4.66.2",
     "pandera>=0.33.1",
+    "scikit-learn>=1.4.2",
+    "mlflow>=3.16.1",
 ]
 
 [dependency-groups]
@@ -37,10 +39,11 @@ dev = [
     "testcontainers[postgres]>=4.4.0",
     "types-python-dateutil>=2.9.0.20260807",
 ]
-# Exploration-only: nothing under src/churn imports these yet. Kept apart
+# Exploration-only: nothing under src/churn imports these. Kept apart
 # from `dependencies` per DECISIONS.md ("add dependencies per-phase
-# rather than front-loading the whole stack") — scikit-learn etc. move to
-# `dependencies` once src/churn/models actually imports them (Phase 4/5).
+# rather than front-loading the whole stack"). scikit-learn and mlflow
+# moved to `dependencies` in Phase 5, once src/churn/models actually
+# started importing them, per this same policy.
 notebooks = [
     "jupyter>=1.0.0",
     "nbconvert>=7.16.3",
@@ -50,9 +53,7 @@ notebooks = [
     "lifelines>=0.29.0",
     "matplotlib>=3.8.4",
     "seaborn>=0.13.2",
-    "scikit-learn>=1.4.2",
     "imbalanced-learn>=0.12.2",
-    "mlflow>=3.16.1",
     "optuna>=5.0.0",
     "shap>=0.51.0",
 ]
@@ -88,6 +89,13 @@ exclude = ["notebooks/", "alembic/versions/"]
 
 [[tool.mypy.overrides]]
 module = ["testcontainers.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# sklearn/mlflow ship no py.typed marker (as of the pinned versions here)
+# -- first exercised in Phase 5, which is the first code under src/ to
+# import either.
+module = ["sklearn.*", "mlflow.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

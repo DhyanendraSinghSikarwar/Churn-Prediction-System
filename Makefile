@@ -22,7 +22,7 @@ ingest:
 	uv run python -m churn.ingestion.cli
 
 train:
-	@echo "Phase 5 not yet built: pipelines/train.py"
+	uv run python pipelines/train.py
 
 score:
 	@echo "Phase 6 not yet built: pipelines/batch_score.py"

@@ -257,11 +257,66 @@ next starts.
     cost-based-threshold arithmetic, the A/B sample-size calculation, and
     every other headline number in this section.
 
-### Phase 5 — Training pipeline + registry — Not started
+### Phase 5 — Training pipeline + registry — **DONE**
 
-- `pipelines/train.py`, data validation gate, model gate against current
-  Production PR-AUC, single sklearn `Pipeline` artifact, MLflow Model
-  Registry stage transitions, model card.
+- `pipelines/train.py` trains the model type Phase 4's evidence actually
+  supports — `LogisticRegression(class_weight="balanced")`, not the GBM
+  the Phase 0 plan assumed — see
+  [DECISIONS.md#production-model-type-follows-phase-4s-evidence-not-the-original-plan](DECISIONS.md#production-model-type-follows-phase-4s-evidence-not-the-original-plan).
+  `src/churn/models/{split,pipeline,registry}.py` hold the reusable
+  split/preprocessing/registry logic as the single source of truth (no
+  longer duplicated per-notebook, closing the exact gap that caused
+  Phase 4's shared-`ColumnTransformer` bug).
+- **Data validation gate**: `validate_training_panel` (Pandera, fail
+  loudly) runs on the modeling panel before any split or fit.
+- **Model gate**: promotes to the registry's `champion` alias only if
+  test PR-AUC beats the current champion's by >=
+  `config.yaml`'s `promotion_epsilon` (0.005), or if there is no
+  champion yet. Uses MLflow's alias API, not the deprecated "stages" API
+  PLAN.md originally named — see
+  [DECISIONS.md#alias-based-registry-api-not-the-deprecated-stages-api](DECISIONS.md#alias-based-registry-api-not-the-deprecated-stages-api).
+- **Single sklearn Pipeline artifact**: one `Pipeline` (preprocessing +
+  model) logged per run via `mlflow.sklearn.save_model` +
+  `mlflow.log_artifacts` — not `mlflow.sklearn.log_model()`, which this
+  project's mlflow *client* (3.x) can't use against its mlflow *server*
+  (pinned to 2.14.1) — see
+  [DECISIONS.md#mlflow-client-3x-vs-server-2x-model-logging-incompatibility](DECISIONS.md#mlflow-client-3x-vs-server-2x-model-logging-incompatibility).
+- **Model card**: generated per run, logged as `model_card.md` on the
+  run — model type and why, features and their Phase 3 provenance,
+  training window, test metrics, Phase 4's known limitations (risk bands
+  need recalibrating, A/B accumulation time, GroupKFold-vs-forward-PR-AUC
+  caution), and the promotion outcome.
+- **Verify — run against the real Postgres + MLflow server, twice, not
+  just written:**
+  - First run (bootstrap, no prior champion): panel validated at 82,343
+    rows (matches Phase 3/4 exactly); split 57,021/14,994/10,328 train/val/test
+    (matches Phase 4 exactly); test PR-AUC **0.1093** (matches Notebook 05
+    exactly, confirming the production code reproduces the notebook
+    result); registered as `churn_classifier` v1; promoted (bootstrap
+    case, no champion to compare against).
+  - Second run (identical, seeded, deterministic): produced the *same*
+    0.1093 test PR-AUC; registered as v2; **correctly not promoted** (ties
+    the champion, doesn't clear `promotion_epsilon`) — the `champion`
+    alias was confirmed still pointing at v1 afterward. This is the gate
+    actually working, not just present in the code.
+  - Model card, registered versions, and the `champion` alias all
+    independently re-fetched and verified readable/loadable after each
+    run (`mlflow.sklearn.load_model("models:/churn_classifier@champion")`
+    returns a working `sklearn.pipeline.Pipeline`).
+  - `scikit-learn` and `mlflow` moved from the `notebooks` dependency
+    group to `dependencies` now that `src/churn/models` actually imports
+    them, per this project's own stated per-phase dependency policy
+    (`pyproject.toml`'s `notebooks` group comment).
+  - 6 new unit tests for `split.py`/`pipeline.py` (100% coverage) and 5
+    for `registry.py`'s gate logic (mocked `MlflowClient`, no real
+    server needed) — including a regression test reproducing the exact
+    shared-`ColumnTransformer` bug class from Phase 4's review, and a
+    regression test for the "identical rerun must not re-promote itself"
+    case the second live run above exercised for real.
+  - `ruff`, `black --check`, `mypy --strict` clean on `src` (added a
+    `sklearn.*`/`mlflow.*` mypy override — neither ships a `py.typed`
+    marker, first exercised here). Full suite: **39/39 tests passing**
+    (unit + testcontainers integration).
 
 ### Phase 6 — Inference API + batch scoring — Not started
 

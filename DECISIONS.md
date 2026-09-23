@@ -795,3 +795,114 @@ Production's own forward-in-time PR-AUC, never a candidate's CV score
 against Production's deployed metric. Comparing a CV number against a
 forward-in-time number would make every candidate look better than it
 is and risk promoting a model that doesn't actually generalize forward.
+
+---
+
+## Phase 5 — Training Pipeline + Registry (2026-09-23)
+
+### production-model-type-follows-phase-4s-evidence-not-the-original-plan
+
+**Situation:** The Phase 0 architecture plan assumed the production model
+would be a GBM (`pipelines/train.py`'s original brief: "baselines →
+GBMs"). Phase 4 found, empirically, that plain
+`LogisticRegression(class_weight="balanced")` beats every GBM variant
+tried on this feature set.
+
+**Decision:** `pipelines/train.py` trains and registers
+`LogisticRegression(class_weight="balanced")`, not a GBM. The evidence
+Phase 4 gathered takes precedence over the plan written before that
+evidence existed.
+
+**Why note this explicitly:** it would be easy for a training pipeline,
+built after the fact by someone re-reading only the original plan, to
+silently "correct" this back to a GBM. `src/churn/models/pipeline.py`'s
+own docstring and this entry both exist so that doesn't happen by
+accident.
+
+### mlflow-client-3x-vs-server-2x-model-logging-incompatibility
+
+**Situation:** `pipelines/train.py`'s first real run of
+`mlflow.sklearn.log_model(pipeline, name="model")` (and, tried next,
+`artifact_path="model"`) both failed identically:
+`MlflowException: API request to endpoint /api/2.0/mlflow/logged-models
+failed with error code 404`.
+
+**Decision:** This project's mlflow *client* resolved to 3.16.1 (`uv add`
+picks the latest satisfying `shap`'s `numpy>=2` requirement — see below),
+but the Docker mlflow *server* is pinned to 2.14.1
+(`docker/mlflow/Dockerfile`, for an unrelated setuptools/pkg_resources
+reason). `mlflow.sklearn.log_model()` unconditionally routes through
+mlflow 3's new "Logged Model" REST API regardless of which parameter is
+passed — a 2.14.1 server simply doesn't have that endpoint. Worked around
+in `src/churn/models/registry.py::log_pipeline_artifact()`: save the
+model *locally* with `mlflow.sklearn.save_model()` (no server call), then
+upload the resulting directory with `mlflow.log_artifacts()` (the
+long-stable artifact endpoint, already proven working in Phase 4).
+Verified end to end against the real server, including registering the
+resulting artifact and loading it back via `models:/churn_classifier@champion`.
+
+**Rejected alternatives:**
+- Downgrading the mlflow *client* to 2.14.1 to match the server. Tried
+  first — `uv` immediately reported a hard conflict: mlflow 2.14.1
+  requires `numpy<2`, `shap` requires `numpy>=2`, and downgrading shap
+  to a `numpy<2`-compatible release would mean re-verifying Phase 3/4's
+  already-reviewed, already-committed notebooks. Not worth it for an
+  incompatibility this narrow (only model *logging* is affected; params/
+  metrics/artifacts already worked fine in Phase 4 against this same
+  server).
+- Upgrading the mlflow *server* to 3.x to match the client. Would fix
+  this properly, but risks a backend-store schema migration against a
+  Postgres database that already holds Phase 4's real run history, for a
+  problem the save_model+log_artifacts workaround solves with no
+  infrastructure change at all. Worth reconsidering if Phase 6/7 hit
+  another 3.x-only feature this workaround can't cover.
+
+### alias-based-registry-api-not-the-deprecated-stages-api
+
+**Situation:** PLAN.md's Phase 5 brief said "MLflow Model Registry stage
+transitions" — written before this project's mlflow client version was
+settled. MLflow's "stages" API (`transition_model_version_stage`) is
+deprecated in modern MLflow in favor of aliases.
+
+**Decision:** `src/churn/models/registry.py` uses
+`set_registered_model_alias` / `get_model_version_by_alias` with a single
+alias, `"champion"` — functionally the same "which version is currently
+serving" concept "Production" staging provided, on the supported API.
+Confirmed both client (3.16.1) and server (2.14.1) support aliases before
+committing to this (unlike the model-logging incompatibility above,
+alias operations are not affected by the client/server version gap).
+
+**Rejected alternative:** using `transition_model_version_stage` because
+PLAN.md named it literally. Rejected because building new code against a
+documented-deprecated API just to match a brief written before the
+implementation details were known would be choosing the wrong tool on
+principle, not for any real requirement — the alias API achieves the
+same intent PLAN.md was describing.
+
+### model-gate-verified-with-two-real-training-runs-not-just-unit-tests
+
+**Situation:** The model promotion gate (`register_and_maybe_promote`)
+is the kind of logic that's easy to unit-test into looking correct while
+still being wrong end-to-end (e.g. an off-by-one in comparing against
+the *wrong* prior metric, or a mocked client hiding a real MLflow API
+mismatch).
+
+**Decision:** Ran `pipelines/train.py` twice against the real Postgres +
+MLflow server, deliberately, before considering Phase 5 done. First run
+(no champion yet) promoted as the bootstrap case. Second run, with
+identical seeded input, produced the identical 0.1093 test PR-AUC and
+was correctly *not* promoted (ties, doesn't clear `promotion_epsilon`) —
+confirmed by independently re-fetching the `champion` alias afterward
+and checking it still pointed at version 1. Unit tests (`test_registry.py`)
+cover the same cases with a mocked client, but the live rerun is what
+actually proves the gate protects the registry, not just that the
+function returns the right boolean in isolation.
+
+**Why this matters:** unit tests for `register_and_maybe_promote` passed
+on the first attempt, before this live verification ever ran — they
+would have passed just as well if `log_pipeline_artifact` or
+`mlflow.register_model` were silently broken, since those are exactly
+what the mocks replace. The two live runs are what this project's
+"verified against real infrastructure, not just written" standard
+(Phase 1 onward) actually requires for something whose entire job is to
+protect a shared registry from a bad promotion.

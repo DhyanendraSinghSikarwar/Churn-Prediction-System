@@ -28,6 +28,8 @@ uv run alembic upgrade head
 uv run python -m churn.ingestion.cli
 uv run python -m churn.features.build_panel
 uv run pytest
+
+uv run python pipelines/train.py   # trains + registers the champion model (Phase 5)
 ```
 
 Equivalent `make` targets exist (`make setup`, `make db-up`, `make ingest`,
@@ -46,8 +48,8 @@ Services once `db-up` has run:
 
 ## Status
 
-Phases 1–4 complete, all verified end-to-end against real containers and
-real notebook execution, not just written:
+Phases 1–5 complete, all verified end-to-end against real containers and
+real notebook/pipeline execution, not just written:
 
 - **Phase 1** (infra + DB + ingestion): 7,043 customers loaded, zero
   orphaned foreign keys, idempotent re-run confirmed. See
@@ -81,8 +83,20 @@ real notebook execution, not just written:
   A/B test design shows the safe operating threshold only flags ~16
   customers/month — a real deployment constraint, not glossed over. See
   [PLAN.md](PLAN.md#phase-4--notebooks-0406--done) for the full numbers.
+- **Phase 5** (training pipeline + registry): `pipelines/train.py` trains
+  and registers the model type Phase 4's evidence actually supports
+  (`LogisticRegression`, not the originally-planned GBM), gated by data
+  validation (Pandera) and a model-promotion gate against the MLflow
+  registry's current champion. Run twice against the real Postgres +
+  MLflow server to prove the gate works, not just the training: the
+  first run bootstrapped the champion (test PR-AUC 0.1093, matching
+  Notebook 05 exactly); the second, identical run correctly was **not**
+  promoted since it only tied the champion rather than beating it by
+  `promotion_epsilon`. See
+  [PLAN.md](PLAN.md#phase-5--training-pipeline--registry--done) for the
+  full verification.
 
-`ruff`, `black --check`, `mypy --strict` clean; 23/23 tests passing
+`ruff`, `black --check`, `mypy --strict` clean; 39/39 tests passing
 (unit + testcontainers integration). See [PLAN.md](PLAN.md) for the full
 phase breakdown and what's next.
 
@@ -91,11 +105,11 @@ phase breakdown and what's next.
 ```
 config/       YAML business/pipeline config (no secrets — see .env.example)
 sql/          ddl (generated from Alembic), features (extraction queries), validation (data-quality queries)
-src/churn/    the package: config, db, ingestion, features, and (from Phase 4 on) models/evaluation/...
+src/churn/    the package: config, db, ingestion, features, models (Phase 5+)
 alembic/      versioned schema migrations — the source of truth for the DB schema
 tests/        unit/ (no Docker needed) and integration/ (testcontainers, needs Docker)
 notebooks/    exploration only — nothing here is imported by src/
-pipelines/    training/batch-scoring orchestration (from Phase 5)
+pipelines/    train.py (Phase 5); batch_score.py (from Phase 6)
 api/          FastAPI serving layer (from Phase 6)
 dashboards/   Streamlit app + static report generator (from Phase 7)
 ```
