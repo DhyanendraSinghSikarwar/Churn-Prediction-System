@@ -15,6 +15,8 @@ and why.
 Full build plan and phase status: [PLAN.md](PLAN.md).
 Every non-obvious judgment call, with the alternative rejected and why:
 [DECISIONS.md](DECISIONS.md).
+Step-by-step commands to reproduce every phase from scratch:
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Quickstart
 
