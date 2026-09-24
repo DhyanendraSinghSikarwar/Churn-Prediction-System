@@ -39,11 +39,21 @@ logger = get_logger(__name__)
 
 
 def _load_scoring_features(cfg: AppConfig) -> pd.DataFrame:
+    # Filters `reference_date` in SQL rather than loading the full ~87k-row
+    # historical panel and filtering client-side in pandas -- the earlier
+    # version did the latter, pulling the entire panel over the wire just
+    # to discard everything but the ~5k-row current cohort. Found by an
+    # independent review. `scoring_cohort()` still runs afterward as a
+    # cheap belt-and-suspenders check now that it's operating on a
+    # already-narrow frame, not as the primary filter.
     engine = get_engine()
     df = pd.read_sql(
-        text("SELECT * FROM feature_snapshots WHERE feature_set_version = :v"),
+        text(
+            "SELECT * FROM feature_snapshots "
+            "WHERE feature_set_version = :v AND reference_date = :rd"
+        ),
         engine,
-        params={"v": cfg.feature_set.version},
+        params={"v": cfg.feature_set.version, "rd": cfg.data.snapshot_date},
     )
     df["reference_date"] = pd.to_datetime(df["reference_date"])
     return scoring_cohort(df, cfg)
@@ -72,7 +82,12 @@ def run() -> None:
         model_version=champion.version.version,
     )
 
-    probabilities = champion.pipeline.predict_proba(features)[:, 1]
+    # Rounded before banding, matching predictions.probability's
+    # NUMERIC(6,5) column -- banding the full-precision value while
+    # storing a rounded one let the stored risk_band disagree with
+    # risk_band(stored probability) right at a boundary. Found by an
+    # independent review.
+    probabilities = [round(float(p), 5) for p in champion.pipeline.predict_proba(features)[:, 1]]
     shap_values = shap_top_features(champion, features)
     bands = [risk_band(p, cfg) for p in probabilities]
 
@@ -81,7 +96,7 @@ def run() -> None:
             "customer_id": customer_id,
             "reference_date": reference_date.date(),
             "model_version": champion.version.version,
-            "probability": float(probability),
+            "probability": probability,
             "risk_band": band,
             "shap_top3": shap,
         }

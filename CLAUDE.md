@@ -138,7 +138,24 @@ what each target runs.
   `/predictions` and `/health` keep working off Postgres alone, and only
   `POST /score/{customer_id}` 503s until a model loads. Don't "fix" this
   by making startup fail hard — that's the graceful-degradation behavior
-  Phase 6 was built for.
+  Phase 6 was built for. `POST /score` *does* re-check the registry
+  alias on every call and reloads if it moved
+  (`_ensure_fresh_champion`) — a promotion made while the API is running
+  is picked up without a restart; only `/health`/`/predictions` skip
+  this check (deliberately, to stay cheap DB-only reads).
+- `predictions.shap_top3` is a rank-ordered **list** of
+  `{"feature": ..., "shap_value": ...}`, keyed by *original* feature
+  name (SHAP values summed across a categorical feature's one-hot
+  columns) — never a dict (JSONB doesn't preserve key order) and never
+  a raw one-hot column name like `cat__contract_type_Two year` (an
+  independent review found the original implementation did both wrong;
+  see DECISIONS.md#shap-values-must-aggregate-to-source-feature-not-stay-one-hot-column-per-entry).
+  Any new code touching `shap_top3` must go through
+  `churn.models.inference.shap_top_features`, never re-derive it.
+- `churn.models.inference.upsert_predictions` chunks at 2,000 rows per
+  statement — Postgres caps bound parameters at 65,535/statement, and
+  this table's 6 columns/row means one statement maxes out around
+  10,922 rows. Don't build a new bulk-upsert path that skips this.
 - `fastapi`/`uvicorn`/`prometheus-client`/`httpx` were already present as
   transitive deps (via mlflow's own bundled server) before Phase 6 added
   them explicitly to `pyproject.toml` — don't assume a package importing

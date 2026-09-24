@@ -1056,3 +1056,264 @@ degradation" requirement — nothing before Phase 6 issued DB reads from
 a long-lived server process that needs to fail fast and stay up; every
 earlier phase's DB access was a short-lived CLI script where a slow
 failure was merely annoying, never a liveness-probe correctness bug.
+
+## Phase 6 post-review fixes (2026-09-24)
+
+An independent review agent (fresh context, briefed to be adversarial,
+given Docker access to verify live rather than just read code) reviewed
+Phase 6 before Phase 7 started. It found one blocker and several real
+"should fix" issues, all verified live against the actual running
+Postgres/MLflow, not asserted from reading alone. Fixed all of them
+before continuing; verified each fix live afterward the same way the
+bug was found.
+
+### shap-values-must-aggregate-to-source-feature-not-stay-one-hot-column-per-entry
+
+**Situation (blocker):** `shap_top_features`'s original implementation
+kept SHAP's raw, post-`ColumnTransformer` one-hot column names
+(`cat__contract_type_Two year`, `cat__contract_type_Month-to-month`,
+...) as `shap_top3`'s keys, exactly matching Notebook 05's prototype.
+The reviewer queried a real stored row and found a Month-to-month
+customer's top-3 included *both* `cat__contract_type_Two year` and
+`cat__contract_type_Month-to-month` — one-hot columns for a contract
+type that customer doesn't even have, with signs that read as directly
+contradictory ("Month-to-month: -0.55" when that customer's actual
+contract type's coefficient is positive). Every stored row had this
+shape; it's mathematically correct (each value really is
+coefficient × (0 − background mean) for that dummy column) but
+meaningless, even actively misleading, as a "top reasons" field —
+exactly the field Phase 7's dashboard is meant to display.
+
+**Decision:** `shap_top_features` now sums SHAP values across every
+one-hot column belonging to the same source feature before ranking
+(`_transformed_name_to_source_feature`, built from
+`ColumnTransformer.transformers_`/`OneHotEncoder.categories_` directly,
+not by parsing the `"cat__<col>_<category>"` string convention, so a
+category value containing an underscore can't corrupt it). This is
+*exact* for a linear model (SHAP values are additive by construction),
+not an approximation. `shap_top3` now names each source feature at most
+once per row (`contract_type`, `tenure_bucket`, ... — never a one-hot
+dummy), and only the customer's actual features can appear.
+
+**Also fixed in the same pass, same root cause:**
+- **Rank order lost in storage** (a "consider" finding, fixed alongside
+  the blocker since it's the same code path): a `dict`'s key order isn't
+  preserved by Postgres JSONB (it sorts by key length on storage), so
+  the "top-3, in order" ranking silently scrambled on every read-back —
+  confirmed live by the reviewer reading the same row two different
+  ways and getting two different orders. `shap_top_features` now returns
+  an ordered `list[{"feature": ..., "shap_value": ...}]`, and
+  `api/schemas.py`'s `PredictionResponse.shap_top3` matches.
+- **Unseen categories scored silently**: `OneHotEncoder(handle_unknown="ignore")`
+  turns an out-of-vocabulary category into all-zero dummies — a valid
+  probability comes out with no error, but no SHAP signal from that
+  feature either, and nothing surfaced that the input was outside the
+  training distribution (reviewer verified this by scoring a fabricated
+  `contract_type="Three year"`). Added `_warn_on_unseen_categories`, a
+  structlog warning (not a hard failure — the score is still valid,
+  just from an area of the input space the model never saw).
+
+**Re-verified live**: re-ran `pipelines/batch_score.py` against the real
+cohort; spot-checked customers whose `contract_type` is `Month-to-month`
+now show `contract_type` at most once, with a sign consistent with that
+contract type's actual coefficient.
+
+**Rejected alternative:** leaving `shap_top3` matching Notebook 05's
+prototype shape for consistency with that notebook. Rejected because
+consistency with a shape that's actively wrong isn't a virtue — the
+notebook's prototype existed to confirm `predictions.shap_top3`'s
+*existence and rough usability*, not to freeze its exact key format; see
+`shap_top_features`'s docstring for the full reasoning.
+
+### upsert-must-chunk-postgres-has-a-65535-bound-parameter-limit-per-statement
+
+**Situation:** The reviewer pushed a single-statement multi-row upsert
+past its real limit: Postgres caps bound parameters at 65,535 per
+statement; `predictions` has 6 upserted columns/row, so one statement
+tops out around 10,922 rows. Verified live in a rolled-back transaction
+— 10,000 rows succeeded, 11,000 failed with `OperationalError: number
+of parameters must be between 0 and 65535`. Today's cohort (5,174) has
+~2x headroom, so this wasn't hit yet, but it's a real landmine for a
+larger cohort or a future dataset.
+
+**Decision:** `upsert_predictions` now chunks at 2,000 rows/statement
+(`_UPSERT_CHUNK_SIZE`), issuing one `INSERT ... ON CONFLICT` per chunk,
+all inside the caller's existing transaction (`conn` is never committed
+inside the helper) — a failure partway through still rolls back
+everything via the caller's `engine.begin()`, not just the failed
+chunk. Re-verified live against the real 5,174-row cohort (now 3
+chunks) and with a mocked-connection unit test asserting chunk count at
+a threshold crossing.
+
+### load-champion-must-resolve-the-alias-exactly-once
+
+**Situation:** `load_champion` called `get_model_version_by_alias`
+*and* loaded the pipeline via `models:/{name}@{alias}`, which
+re-resolves the same alias a second time. If a promotion landed between
+the two calls, the loaded pipeline and its own metadata
+(`version.version`, used as `predictions.model_version`; `version.run_id`,
+used to fetch the background sample) could silently come from two
+different model versions — a narrow window, but a real
+TOCTOU-shaped bug, not just a style nit. Also flagged: the `run_id`
+null-check used a bare `assert`, which `python -O` strips entirely.
+
+**Decision:** Resolve the alias once, then load the pipeline by that
+*exact* version (`models:/{name}/{version.version}`), never by
+re-resolving the alias. Replaced the `assert` with an explicit
+`raise ValueError(...)`.
+
+### api-must-detect-and-pick-up-a-newly-promoted-champion
+
+**Situation:** The FastAPI process loads its champion once, at startup
+(`lifespan`), into `app.state.champion`. Nothing ever re-checked the
+registry afterward. The reviewer traced a concrete failure mode this
+enables: promote a new champion (e.g. `batch_score.py`'s next run
+writes fresh rows under the new version) while the API keeps running
+on the old one; a `POST /score` in that window would write a row under
+the *old* model's version with a *newer* `scored_at`, and
+`GET /predictions`'s `ORDER BY scored_at DESC LIMIT 1` would then serve
+that stale-model row ahead of the newer batch-scored one — a silent,
+hard-to-detect data-freshness bug, not a crash.
+
+**Decision:** `POST /score` now checks the registry's current
+`champion` alias version (`current_champion_version` — a cheap
+metadata-only call) before scoring, and reloads the full champion if it
+has moved (`_ensure_fresh_champion`), so an on-demand score can never be
+computed by a model older than the one that just got promoted. A
+registry-unreachable failure during this check is non-fatal (falls back
+to whatever's already loaded), consistent with this API's existing
+graceful-degradation design. `GET /health` deliberately does **not** do
+this check on every call — it's meant to stay a fast, DB-only liveness
+probe, and `/score` is the only endpoint whose *correctness* (not just
+availability) depends on freshness.
+
+**Rejected alternatives:**
+- A background polling thread that periodically re-checks the alias.
+  Rejected as more moving parts (thread lifecycle, startup/shutdown
+  wiring) for a check that's already cheap enough to do inline, on the
+  one request path that actually needs it.
+- Changing `GET /predictions`'s ordering to prefer the current
+  champion's `model_version` instead of `scored_at DESC`. Rejected: the
+  root cause is that `/score` could ever write a stale-model row in the
+  first place; fixing that directly (this decision) makes the ordering
+  question moot rather than working around a bug that shouldn't happen.
+
+### probability-must-be-rounded-before-risk-banding-not-after
+
+**Situation:** `risk_band()` was called on the full-precision
+probability, but `predictions.probability` is `NUMERIC(6,5)` — rounded
+to 5 decimal places on storage. Right at a boundary (e.g. probability
+0.300004: bands "medium" at full precision, but rounds to 0.30000 on
+storage, which itself would band "low"), the stored `probability` and
+the stored `risk_band` could describe two different bands. Verified by
+the reviewer reading the code path, not by hitting the exact boundary
+live (it's a 5th-decimal-place edge case) — real enough to fix cheaply
+regardless.
+
+**Decision:** Round the probability to 5 decimals immediately after
+`predict_proba`, before computing `risk_band` or building the row to
+store, in both `pipelines/batch_score.py` and `api/main.py`'s
+`score_customer` — so the value banded and the value stored are always
+the exact same number.
+
+### score-endpoints-db-write-must-be-covered-by-the-same-503-handling-as-its-read
+
+**Situation:** `POST /score`'s DB *read* (the feature-snapshot lookup)
+was wrapped in a `try/except SQLAlchemyError` returning 503, but the
+subsequent `upsert_predictions` *write* was not — a DB outage landing
+between the read and the write would surface as a bare, unhandled 500
+instead of the 503 every other DB-dependent path in this API returns.
+
+**Decision:** Wrapped the upsert call in the same
+`try/except SQLAlchemyError -> HTTPException(503)` pattern.
+
+### prometheus-path-label-must-not-be-the-raw-unmatched-request-path
+
+**Situation:** The metrics middleware labeled Prometheus series by
+`route.path` when a route matched, but fell back to the *raw request
+path* (`request.url.path`) when nothing matched. The reviewer verified
+live: hitting four made-up URLs created four new, permanent label
+combinations in `/metrics` — an unauthenticated way for anyone to grow
+this process's memory by scanning random paths, since Prometheus
+client libraries keep every label combination they've ever seen.
+
+**Decision:** Unmatched routes now share one constant label,
+`"<unmatched>"`, regardless of what path was requested. A real route's
+label is always its *template* (e.g. `"/predictions/{customer_id}"`),
+never the substituted value, so cardinality was already bounded there;
+this closes the one place it wasn't.
+
+### batch-score-must-filter-the-scoring-cohort-in-sql-not-in-pandas
+
+**Situation:** `_load_scoring_features` queried the *entire*
+`feature_snapshots` table (~87k historical rows across every monthly
+cohort ever built) and filtered down to the current ~5k-row cohort
+client-side, in pandas, after transferring all of it over the wire.
+
+**Decision:** Added `AND reference_date = :rd` to the SQL query itself.
+`scoring_cohort()` still runs afterward as a cheap redundant check now
+that it's operating on an already-narrow frame, not as the primary
+filter — defense in depth, not wasted work, since the historical
+panel only grows over time.
+
+### champion-run-must-log-and-be-checked-against-its-training-time-feature-list
+
+**Situation:** `/score` builds its feature DataFrame from
+`config/selected_features_<feature_set.version>.yaml`, read fresh at
+request time — not from anything recorded on the champion model
+itself. If that yaml changed (a new `feature_set.version`, or a hand
+edit) without retraining, scoring would silently run the champion
+against a different feature set than it was trained on: either a
+`KeyError` if a feature disappeared, or worse, no crash and a
+plausible-but-wrong score if the sets merely overlapped differently.
+Currently latent (only `v1` exists), but a real risk class, not a
+hypothetical one — this is exactly the kind of gap that produces
+silently wrong predictions instead of a loud failure.
+
+**Decision:** `load_champion` now compares the champion's own logged
+`selected_features` training param (already logged by
+`pipelines/train.py`, no new logging needed) against what
+`load_selected_features(get_app_config())` resolves to *right now*, and
+logs a structlog warning (not a hard failure — availability still
+matters more than a config drift that hasn't been proven harmful yet)
+on any mismatch. Uses data already being logged rather than adding a
+new artifact or tag.
+
+### background-sample-csv-should-not-trust-pandas-default-na-parsing
+
+**Situation (minor hardening, not an active bug):** `read_csv`'s
+default `keep_default_na=True` turns the literal strings "NA", "None",
+"null", "" (and others) into `NaN` on read. The reviewer confirmed
+none of this feature set's current category values collide with that
+list, but the background sample is training data whose categories
+aren't validated against pandas' NA sentinel list — nothing prevents a
+future feature or dataset variant from silently corrupting a category
+value on this exact CSV round-trip.
+
+**Decision:** `load_champion` now reads the background sample with
+`keep_default_na=False`.
+
+### deferred-without-a-code-change
+
+The reviewer raised two further points, evaluated and consciously not
+acted on for now:
+
+- **A separate `/ready` endpoint distinct from `/health`.** `/health`
+  currently returns `200` even when the model is unavailable (by
+  design — the DB is this API's core liveness dependency; a missing
+  model is a degraded *capability*, not a liveness failure). A
+  `/ready`-vs-`/health` split is a real Kubernetes-style pattern, but
+  nothing in this project runs an orchestrator that would consume a
+  distinct readiness probe yet — adding one now would be speculative
+  infrastructure with no consumer. Revisit if/when Phase 7 or later
+  introduces real orchestration.
+- **`RETURNING`'s row-order guarantee** on a multi-row
+  `INSERT ... ON CONFLICT`. Postgres doesn't formally document
+  `RETURNING` order for this statement shape. It doesn't matter for
+  correctness here — verified live that every row upserted in one
+  statement shares the same `scored_at` (both the `INSERT` default and
+  the `DO UPDATE` use `now()`, the transaction start time), and neither
+  caller (`batch_score.py` uses only the count; `/score` sends a single
+  row) depends on per-row ordering — but `upsert_predictions`'s
+  docstring was softened to describe that equivalence instead of
+  claiming an order guarantee Postgres doesn't actually make.

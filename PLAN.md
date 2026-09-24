@@ -407,6 +407,51 @@ next starts.
     widened to cover all three, matching the fact that `pipelines/`
     already existed since Phase 5 but was never actually added to the
     documented lint scope until now).
+- **Independently reviewed post-hoc** (a fresh agent, no prior context,
+  briefed to be adversarial, with Docker access to verify live rather
+  than just read code) before Phase 7 started. Found and this project
+  fixed one real blocker and eight further real issues, all verified
+  live — see
+  [DECISIONS.md#shap-values-must-aggregate-to-source-feature-not-stay-one-hot-column-per-entry](DECISIONS.md#shap-values-must-aggregate-to-source-feature-not-stay-one-hot-column-per-entry)
+  for the full list:
+  - **Blocker**: `shap_top3` named one-hot dummy columns individually
+    (e.g. both `cat__contract_type_Two year` and
+    `cat__contract_type_Month-to-month` for the same customer), reading
+    as contradictory nonsense and affecting every one of the 5,174
+    already-stored rows — this exact field is what Phase 7's dashboard
+    will show. Fixed by aggregating SHAP values to source features
+    before ranking (exact for a linear model), and switched storage
+    from a dict (loses rank order on JSONB round-trip, also found live)
+    to an ordered list.
+  - A real scale limit (`upsert_predictions` broke above ~10,922 rows —
+    Postgres's per-statement bound-parameter cap), now chunked.
+  - A real freshness gap (the API never picked up a newly promoted
+    champion without a restart, and could shadow a newer batch-scored
+    row with a stale one) — now checked and reloaded on every `/score`
+    call.
+  - A TOCTOU-shaped bug in `load_champion` (resolved the champion alias
+    twice), an inconsistent probability/risk_band rounding boundary, an
+    inconsistent 500-vs-503 on a DB failure mid-`/score`, an unbounded
+    Prometheus label cardinality on unmatched routes, and
+    `batch_score.py` loading the full historical panel instead of
+    filtering in SQL — all fixed and re-verified live.
+  - Confirmed clean/ruled out (verified, not assumed): SQL injection
+    surface, `RETURNING` ordering (doesn't matter here — every row in
+    one statement shares its `now()`-based `scored_at`), `Decimal`→float
+    coercion through the API, `partial`-failure atomicity of the batch
+    upsert, and the two fixes from the phase's own first live
+    verification pass (the champion re-promotion, the DB connect
+    timeout).
+  - Re-ran `pipelines/batch_score.py` against the real 5,174-customer
+    cohort after every fix; risk band counts unchanged (low=2,841/
+    medium=1,745/high=588, as expected — the model didn't change, only
+    the serving/storage logic did); spot-checked `shap_top3` against
+    real `contract_type` values to confirm the aggregation fix.
+  - 12 new/changed unit tests covering the fixes (SHAP aggregation +
+    ranking regression tests, upsert chunking, a successful `/score`
+    path and a champion-reload path — neither existed before the
+    review — and a real `decimal.Decimal` in the `/predictions` test
+    fixture, which the original test's plain `float` never exercised).
 
 ### Phase 7 — Monitoring + dashboard — Not started
 

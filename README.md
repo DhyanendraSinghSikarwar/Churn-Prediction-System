@@ -111,7 +111,13 @@ real notebook/pipeline execution, not just written:
   fixed). See
   [PLAN.md](PLAN.md#phase-6--inference-api--batch-scoring--done) for the
   full verification, including a required registry re-promotion this
-  phase needed and documented rather than glossed over.
+  phase needed and documented rather than glossed over. Independently
+  reviewed post-hoc before Phase 7: found and fixed one real blocker
+  (`shap_top3` named one-hot dummy columns individually, reading as
+  contradictory nonsense for the exact field Phase 7's dashboard will
+  show) plus eight further real issues, all verified live — see
+  [PLAN.md](PLAN.md#phase-6--inference-api--batch-scoring--done) and
+  [DECISIONS.md](DECISIONS.md#shap-values-must-aggregate-to-source-feature-not-stay-one-hot-column-per-entry).
 
 `ruff`, `black --check`, `mypy --strict` clean on `src`, `pipelines`, and
 `api`. See [PLAN.md](PLAN.md) for the full phase breakdown, current test

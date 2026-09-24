@@ -29,6 +29,7 @@ import mlflow
 import pandas as pd
 import structlog
 from fastapi import FastAPI, HTTPException, Request, Response
+from mlflow.tracking import MlflowClient
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -41,6 +42,7 @@ from churn.db.session import get_session
 from churn.models.inference import (
     ChampionModel,
     PredictionRow,
+    current_champion_version,
     load_champion,
     risk_band,
     shap_top_features,
@@ -103,8 +105,14 @@ async def metrics_middleware(
     start = time.perf_counter()
     response = await call_next(request)
     duration = time.perf_counter() - start
+    # An unmatched route (a probe, a typo'd path) has no route *template*
+    # to label with -- falling back to the raw request path would let
+    # anyone generate unbounded Prometheus series just by hitting random
+    # URLs. Found by an independent review actually doing that. A real
+    # route's `path` is always its template (e.g. "/predictions/{customer_id}"),
+    # never the substituted value, so cardinality stays bounded either way.
     route = request.scope.get("route")
-    path = route.path if route is not None else request.url.path
+    path = route.path if route is not None else "<unmatched>"
     REQUEST_COUNT.labels(method=request.method, path=path, status=response.status_code).inc()
     REQUEST_LATENCY.labels(method=request.method, path=path).observe(duration)
     return response
@@ -157,11 +165,35 @@ def get_prediction(customer_id: str) -> PredictionResponse:
     return PredictionResponse.model_validate(row)
 
 
-@app.post("/score/{customer_id}", response_model=PredictionResponse)
-def score_customer(customer_id: str, request: Request) -> PredictionResponse:
+def _ensure_fresh_champion(request: Request) -> ChampionModel:
+    """Reloads the champion if the registry's alias has moved since this
+    process started -- otherwise a long-lived API process serves a
+    stale, superseded model indefinitely (only a restart would pick up a
+    promotion), and worse, an on-demand `/score` from the stale model
+    could overwrite a newer batch-scored row with a newer `scored_at`,
+    silently shadowing it. Found by an independent review, not by
+    inspection. Failure here (registry unreachable) is not fatal: falls
+    back to whatever's already loaded, consistent with this API's
+    graceful-degradation design."""
     champion: ChampionModel | None = request.app.state.champion
+    cfg: AppConfig = request.app.state.cfg
+    try:
+        client = MlflowClient()
+        latest_version = current_champion_version(cfg.mlflow.registry_model_name, client)
+        if champion is None or champion.version.version != latest_version:
+            champion = load_champion(cfg.mlflow.registry_model_name, client=client)
+            request.app.state.champion = champion
+            logger.info("champion_reloaded", model_version=champion.version.version)
+    except Exception:
+        logger.warning("champion_freshness_check_failed", exc_info=True)
     if champion is None:
         raise HTTPException(status_code=503, detail="model unavailable")
+    return champion
+
+
+@app.post("/score/{customer_id}", response_model=PredictionResponse)
+def score_customer(customer_id: str, request: Request) -> PredictionResponse:
+    champion = _ensure_fresh_champion(request)
     cfg: AppConfig = request.app.state.cfg
 
     selected_features = load_selected_features(cfg)
@@ -190,7 +222,13 @@ def score_customer(customer_id: str, request: Request) -> PredictionResponse:
         )
 
     features = snapshot[selected_features]
-    probability = float(champion.pipeline.predict_proba(features)[:, 1][0])
+    # Rounded *before* risk-banding, matching `predictions.probability`'s
+    # NUMERIC(6,5) column -- banding the full-precision value and then
+    # storing a rounded one meant the stored `risk_band` could disagree
+    # with `risk_band(stored probability)` right at a boundary (e.g.
+    # 0.300004 bands "medium" but rounds to 0.30000, which bands "low").
+    # Found by an independent review, not by inspection.
+    probability = round(float(champion.pipeline.predict_proba(features)[:, 1][0]), 5)
     band = risk_band(probability, cfg)
     shap_values = shap_top_features(champion, features)[0]
 
@@ -202,8 +240,16 @@ def score_customer(customer_id: str, request: Request) -> PredictionResponse:
         "risk_band": band,
         "shap_top3": shap_values,
     }
-    with engine.begin() as conn:
-        scored_at = upsert_predictions(conn, [row])[0]
+    try:
+        with engine.begin() as conn:
+            scored_at = upsert_predictions(conn, [row])[0]
+    except SQLAlchemyError as exc:
+        # Previously only the read above was guarded, so a DB outage
+        # between the read and this write surfaced as a bare 500 instead
+        # of the same 503 every other DB-dependent path returns. Found by
+        # an independent review.
+        logger.warning("score_customer_upsert_failed", exc_info=True)
+        raise HTTPException(status_code=503, detail="database unreachable") from exc
 
     logger.info("customer_scored_on_demand", customer_id=customer_id, probability=probability)
     PREDICTION_PROBABILITY.observe(probability)

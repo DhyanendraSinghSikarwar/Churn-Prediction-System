@@ -1,5 +1,5 @@
 import datetime as dt
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -10,7 +10,16 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from churn.config import AppConfig
-from churn.models.inference import ChampionModel, risk_band, scoring_cohort, shap_top_features
+from churn.models.inference import (
+    _UPSERT_CHUNK_SIZE,
+    ChampionModel,
+    PredictionRow,
+    _warn_on_unseen_categories,
+    risk_band,
+    scoring_cohort,
+    shap_top_features,
+    upsert_predictions,
+)
 
 
 @pytest.fixture
@@ -122,7 +131,7 @@ def _fitted_toy_pipeline() -> Pipeline:
     return pipeline
 
 
-def test_shap_top_features_returns_top_n_per_row() -> None:
+def _toy_champion() -> tuple[ChampionModel, Pipeline]:
     pipeline = _fitted_toy_pipeline()
     background = pd.DataFrame(
         {
@@ -131,7 +140,11 @@ def test_shap_top_features_returns_top_n_per_row() -> None:
         }
     )
     champion = ChampionModel(pipeline=pipeline, version=MagicMock(), background=background)
+    return champion, pipeline
 
+
+def test_shap_top_features_returns_top_n_per_row() -> None:
+    champion, _ = _toy_champion()
     features = pd.DataFrame(
         {"contract_type": ["Month-to-month", "Two year"], "tenure_months": [3, 60]}
     )
@@ -140,4 +153,104 @@ def test_shap_top_features_returns_top_n_per_row() -> None:
     assert len(result) == 2
     for row in result:
         assert len(row) <= 2
-        assert all(isinstance(v, float) for v in row.values())
+        assert all(isinstance(entry["shap_value"], float) for entry in row)
+        assert all(isinstance(entry["feature"], str) for entry in row)
+
+
+def test_shap_top_features_returns_a_ranked_list_not_a_dict() -> None:
+    """Regression test: a dict silently loses rank order on a JSONB
+    round-trip (Postgres sorts JSONB keys by length, not insertion
+    order) -- found by an independent review comparing the same row read
+    back two different ways. `shap_top_features` must return an ordered
+    list."""
+    champion, _ = _toy_champion()
+    features = pd.DataFrame({"contract_type": ["Two year"], "tenure_months": [60]})
+    result = shap_top_features(champion, features, top_n=3)[0]
+
+    assert isinstance(result, list)
+    magnitudes = [abs(entry["shap_value"]) for entry in result]
+    assert magnitudes == sorted(magnitudes, reverse=True)
+
+
+def test_shap_top_features_aggregates_one_hot_columns_by_source_feature() -> None:
+    """Regression test for the blocker an independent review found: the
+    old implementation kept one-hot column names as-is, so a customer's
+    "top reasons" could name contract types they don't have (e.g.
+    `cat__contract_type_Two year` appearing for a Month-to-month
+    customer). Aggregating by source feature means `contract_type` can
+    appear at most once per row, never once per category."""
+    champion, _ = _toy_champion()
+    features = pd.DataFrame(
+        {"contract_type": ["Month-to-month", "One year", "Two year"], "tenure_months": [3, 30, 60]}
+    )
+    results = shap_top_features(champion, features, top_n=3)
+
+    for row in results:
+        feature_names = [entry["feature"] for entry in row]
+        assert len(feature_names) == len(set(feature_names)), "a feature appeared more than once"
+        for name in feature_names:
+            assert name in {"contract_type", "tenure_months"}
+            assert not name.startswith("cat__")
+            assert not name.startswith("num__")
+
+
+def test_warn_on_unseen_categories_logs_but_does_not_raise() -> None:
+    champion, pipeline = _toy_champion()
+    features = pd.DataFrame({"contract_type": ["Three year"], "tenure_months": [12]})
+    prep = pipeline.named_steps["prep"]
+
+    with patch("churn.models.inference.logger") as mock_logger:
+        _warn_on_unseen_categories(prep, features)
+
+    mock_logger.warning.assert_called_once()
+    args, kwargs = mock_logger.warning.call_args
+    assert args[0] == "unseen_category_scored"
+    assert kwargs["unseen_values"] == ["Three year"]
+
+
+def test_warn_on_unseen_categories_silent_when_all_known() -> None:
+    champion, pipeline = _toy_champion()
+    features = pd.DataFrame({"contract_type": ["One year"], "tenure_months": [12]})
+    prep = pipeline.named_steps["prep"]
+
+    with patch("churn.models.inference.logger") as mock_logger:
+        _warn_on_unseen_categories(prep, features)
+
+    mock_logger.warning.assert_not_called()
+
+
+def _prediction_row(customer_id: str) -> PredictionRow:
+    return PredictionRow(
+        customer_id=customer_id,
+        reference_date=dt.date(2024, 6, 1),
+        model_version="1",
+        probability=0.5,
+        risk_band="medium",
+        shap_top3=[{"feature": "tenure_months", "shap_value": 0.1}],
+    )
+
+
+def test_upsert_predictions_chunks_large_batches() -> None:
+    """Regression test: a single multi-row upsert statement is capped by
+    Postgres's 65535-bound-parameter limit (6 columns/row -> ~10,922
+    rows/statement). Found live by an independent review pushing a batch
+    past that limit. `upsert_predictions` must issue multiple statements
+    rather than one oversized one."""
+    rows = [_prediction_row(f"C{i}") for i in range(_UPSERT_CHUNK_SIZE + 1)]
+    conn = MagicMock()
+    conn.execute.return_value = [MagicMock(scored_at=dt.datetime(2024, 6, 1))] * _UPSERT_CHUNK_SIZE
+
+    upsert_predictions(conn, rows)
+
+    assert conn.execute.call_count == 2  # one full chunk + a one-row remainder
+
+
+def test_upsert_predictions_issues_one_statement_for_a_small_batch() -> None:
+    rows = [_prediction_row("C1"), _prediction_row("C2")]
+    conn = MagicMock()
+    conn.execute.return_value = [MagicMock(scored_at=dt.datetime(2024, 6, 1))] * 2
+
+    result = upsert_predictions(conn, rows)
+
+    assert conn.execute.call_count == 1
+    assert len(result) == 2
