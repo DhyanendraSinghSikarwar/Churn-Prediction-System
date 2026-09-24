@@ -53,3 +53,12 @@ business:
   risk_bands:
     low_max: 0.3
     medium_max: 0.7
+
+# Feature-drift alerting thresholds (Phase 7). PSI bands follow the
+# conventional industry rule of thumb (<0.1 stable, 0.1-0.25 moderate
+# shift worth watching, >0.25 significant shift) -- not fitted to this
+# project's data, a documented starting point like risk_bands above.
+monitoring:
+  psi_warning_threshold: 0.1
+  psi_critical_threshold: 0.25
+  drift_bins: 10

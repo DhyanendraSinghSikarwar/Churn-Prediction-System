@@ -6,7 +6,7 @@ Production-style customer churn prediction system (Postgres → idempotent
 ingestion → SQL feature extraction → training → serving API → monitoring)
 built on the IBM Telco Customer Churn dataset. **Synthetic-data demo** —
 everything with a date on it is a seeded, documented synthetic layer, not
-real telecom events; see DECISIONS.md. Currently Phase 6/8 done — see
+real telecom events; see DECISIONS.md. Currently Phase 7/8 done — see
 PLAN.md for phase status, DECISIONS.md for the why behind every
 non-obvious call.
 
@@ -21,10 +21,15 @@ uv run python -m churn.ingestion.cli                      # ingest
 uv run python pipelines/train.py                          # train + register (Phase 5)
 uv run python pipelines/batch_score.py                    # batch-score the current cohort (Phase 6)
 uv run uvicorn api.main:app --host 0.0.0.0 --port 8000     # serve the inference API (Phase 6)
+uv run python pipelines/backfill_predictions.py            # backtest every historical cohort (Phase 7)
+uv run python pipelines/monitor.py                        # log drift + performance-decay checks (Phase 7)
+uv run streamlit run dashboards/app.py                    # interactive monitoring dashboard (Phase 7)
+uv run python dashboards/report.py                        # static monitoring report -> reports/ (Phase 7)
+uv run python pipelines/flows.py                          # run the whole pipeline as one Prefect flow (Phase 7)
 uv run pytest                                             # full suite (needs Docker)
 uv run pytest tests/unit                                  # unit only, no Docker
-uv run ruff check src tests pipelines api && uv run black --check src tests pipelines api && uv run mypy src pipelines api   # lint
-uv run ruff check --fix src tests pipelines api && uv run black src tests pipelines api                                     # format
+uv run ruff check src tests pipelines api dashboards && uv run black --check src tests pipelines api dashboards && uv run mypy src pipelines api dashboards   # lint
+uv run ruff check --fix src tests pipelines api dashboards && uv run black src tests pipelines api dashboards                                                # format
 ```
 
 Equivalent `make` targets exist (`make setup`, `make db-up`, `make test`, …)
@@ -51,7 +56,24 @@ what each target runs.
   to `predictions`; `api/main.py` serves those rows plus an on-demand
   single-customer rescore — both built on `src/churn/models/inference.py`,
   neither duplicates its logic.
-- `dashboards/` — scaffolded, not yet built (Phase 7).
+- `src/churn/monitoring/` — `drift.py` (PSI/KS/KL between a reference and
+  a comparison feature distribution) and `performance.py` (per-cohort
+  classification metrics from matured `predictions` rows). Pure
+  computation, no I/O — `pipelines/monitor.py` (logs findings),
+  `dashboards/app.py` (interactive), and `dashboards/report.py` (static
+  HTML) are the only three callers, and none of them persist results;
+  see DECISIONS.md#monitoring-results-are-computed-on-demand-not-persisted.
+- `pipelines/backfill_predictions.py` scores every *historical* cohort
+  with the current champion and backfills `predictions.actual_churned`
+  from the already-matured `feature_snapshots.label_churn_next_30d` — a
+  retrospective backtest, not a live signal; see
+  DECISIONS.md#backfill-predictions-scores-historical-cohorts-as-a-retrospective-backtest.
+- `pipelines/flows.py` — a Prefect flow wrapping every pipeline stage as
+  a task that shells out to that stage's own standalone CLI command
+  (never an in-process import); see
+  DECISIONS.md#prefect-tasks-shell-out-to-the-existing-cli-scripts-not-in-process-imports.
+- `dashboards/` — `app.py` (Streamlit, `streamlit run dashboards/app.py`)
+  and `report.py` (static HTML, writes to `reports/`, gitignored).
 
 ## Conventions
 
@@ -160,3 +182,38 @@ what each target runs.
   transitive deps (via mlflow's own bundled server) before Phase 6 added
   them explicitly to `pyproject.toml` — don't assume a package importing
   cleanly means it's an intentional dependency; check `pyproject.toml`.
+- `predictions` rows come in two shapes: just-scored (`batch_score.py`/
+  `api/main.py`, `actual_churned`/`label_matured_at` both NULL — label
+  hasn't matured) and backfilled (`backfill_predictions.py`, both
+  populated — a historical, already-known outcome). Filter on
+  `actual_churned IS NOT NULL` before computing any performance metric
+  (`src/churn/monitoring/performance.py` already does); scoring the
+  unmatured rows as if they had a label is a silent correctness bug, not
+  a crash.
+- `src/churn/monitoring/performance.py`'s per-cohort numbers are **not**
+  directly comparable to Phase 5's pooled test-window PR-AUC (0.1093) —
+  one number per calendar month vs. one number over the whole pooled
+  test window are different statistics computed on different (though
+  overlapping) samples. Both are legitimate; don't treat a mismatch
+  between them as a bug.
+- `pipelines/flows.py`'s Prefect tasks shell out via `subprocess.run`,
+  not in-process imports — `pipelines/` has no `__init__.py`
+  (`from pipelines.flows import run_script` doesn't work as a package
+  import); run `uv run python pipelines/flows.py` directly, same as
+  every other pipeline entry point.
+- Streamlit's `use_container_width` is deprecated (removed after
+  2025-12-31) — use `width="stretch"`/`width="content"` in any new
+  `dashboards/app.py` code, not `use_container_width=True/False`.
+- Testing a Streamlit app headlessly (no real browser) needs
+  `streamlit.testing.v1.AppTest`, not `curl` — Streamlit only executes
+  the script per-websocket-session, so hitting the server with `curl`
+  proves the process is up, never that the script itself runs without
+  exceptions or renders the expected elements. `AppTest.from_file(path)`
+  resolves `path` relative to the *calling* script's location, not cwd —
+  pass an absolute path if the caller isn't in the project root.
+- `pipelines/flows.py` may print a `sqlite3.OperationalError: database
+  is locked` traceback at startup (writing its `TELEMETRY_SESSION` row)
+  — this is Prefect's own local ephemeral-server SQLite backend, not
+  Postgres, and not this project's code; it doesn't fail the flow run
+  (every task still runs, exit code 0). Harmless noise, same category as
+  the mlflow emoji/cp1252 gotcha below — don't chase it as a bug.

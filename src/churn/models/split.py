@@ -28,6 +28,14 @@ def modeling_panel(panel: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
     return panel[panel["reference_date"] < snapshot_ts].copy()
 
 
+def _split_boundaries(cfg: AppConfig) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    panel_start = pd.Timestamp(cfg.data.panel_start_date)
+    train_end = panel_start + relativedelta(months=cfg.data.train_months)
+    val_end = train_end + relativedelta(months=cfg.data.validation_months)
+    test_end = val_end + relativedelta(months=cfg.data.test_months)
+    return train_end, val_end, test_end
+
+
 def time_based_split(
     panel: pd.DataFrame, cfg: AppConfig
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -42,12 +50,27 @@ def time_based_split(
     splitting, and is exactly what Phase 4's notebooks found and
     documented (see PLAN.md's confirmed assumptions).
     """
-    panel_start = pd.Timestamp(cfg.data.panel_start_date)
-    train_end = panel_start + relativedelta(months=cfg.data.train_months)
-    val_end = train_end + relativedelta(months=cfg.data.validation_months)
-    test_end = val_end + relativedelta(months=cfg.data.test_months)
+    train_end, val_end, test_end = _split_boundaries(cfg)
 
     train = panel[panel["reference_date"] < train_end]
     val = panel[(panel["reference_date"] >= train_end) & (panel["reference_date"] < val_end)]
     test = panel[(panel["reference_date"] >= val_end) & (panel["reference_date"] < test_end)]
     return train, val, test
+
+
+def dataset_split_label(reference_date: pd.Timestamp, cfg: AppConfig) -> str:
+    """Which of train/validation/test/post-test a single `reference_date`
+    falls into, using the exact same boundaries as `time_based_split` --
+    so Phase 7's monitoring can honestly label a historical cohort as
+    in-sample or held-out, never presenting training-window performance
+    as if it were the held-out test score (the same discipline
+    DECISIONS.md#groupkfold-cv-score-is-not-comparable-to-forward-in-time-pr-auc
+    already applies to CV scores)."""
+    train_end, val_end, test_end = _split_boundaries(cfg)
+    if reference_date < train_end:
+        return "train"
+    if reference_date < val_end:
+        return "validation"
+    if reference_date < test_end:
+        return "test"
+    return "post-test"

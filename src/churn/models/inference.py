@@ -13,7 +13,7 @@ import datetime as dt
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import mlflow
 import numpy as np
@@ -57,6 +57,13 @@ class PredictionRow(TypedDict):
     probability: float
     risk_band: str
     shap_top3: list[ShapFeature]
+    # Only present for a historical, already-matured cohort
+    # (`pipelines/backfill_predictions.py`) -- absent for a just-scored,
+    # label-not-matured-yet row (`pipelines/batch_score.py`, `api/main.py`).
+    # A single call to `upsert_predictions` must be all-one-or-all-other;
+    # see its docstring.
+    actual_churned: NotRequired[bool]
+    label_matured_at: NotRequired[dt.datetime]
 
 
 def scoring_cohort(panel: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
@@ -269,16 +276,25 @@ def shap_top_features(
     return results
 
 
-def _upsert_predictions_chunk(conn: Connection, rows: list[PredictionRow]) -> list[dt.datetime]:
+def _upsert_predictions_chunk(
+    conn: Connection, rows: list[PredictionRow], with_labels: bool
+) -> list[dt.datetime]:
     insert_stmt = pg_insert(Prediction).values(list(rows))
+    set_ = {
+        "probability": insert_stmt.excluded.probability,
+        "risk_band": insert_stmt.excluded.risk_band,
+        "shap_top3": insert_stmt.excluded.shap_top3,
+        "scored_at": text("now()"),
+    }
+    if with_labels:
+        # Only `pipelines/backfill_predictions.py` sends these -- a
+        # historical cohort's label is already known (matured) at
+        # backfill time, unlike `batch_score.py`/`api/main.py`'s
+        # just-scored rows, which never touch these two columns.
+        set_["actual_churned"] = insert_stmt.excluded.actual_churned
+        set_["label_matured_at"] = insert_stmt.excluded.label_matured_at
     upsert_stmt = insert_stmt.on_conflict_do_update(
-        constraint="uq_predictions_customer_ref_model",
-        set_={
-            "probability": insert_stmt.excluded.probability,
-            "risk_band": insert_stmt.excluded.risk_band,
-            "shap_top3": insert_stmt.excluded.shap_top3,
-            "scored_at": text("now()"),
-        },
+        constraint="uq_predictions_customer_ref_model", set_=set_
     ).returning(Prediction.scored_at)
     result = conn.execute(upsert_stmt)
     # Every row in one statement shares its `scored_at` (both the INSERT
@@ -292,24 +308,31 @@ def upsert_predictions(conn: Connection, rows: list[PredictionRow]) -> list[dt.d
     """Inserts scored rows into `predictions`, overwriting on a repeat
     `(customer_id, reference_date, model_version)` rather than
     duplicating it -- shared by `pipelines/batch_score.py` (bulk, one
-    cohort at a time) and `api/main.py`'s on-demand rescoring endpoint
-    (one row at a time).
+    cohort at a time), `api/main.py`'s on-demand rescoring endpoint (one
+    row at a time), and `pipelines/backfill_predictions.py` (bulk,
+    historical cohorts whose label has already matured).
+
+    `rows` must be internally consistent: either every row includes
+    `actual_churned`/`label_matured_at` (the backfill case) or none do
+    (the live-scoring case) -- never a mix within one call. Determined
+    once from `rows[0]`, not re-checked per row.
 
     Chunked at `_UPSERT_CHUNK_SIZE`: Postgres caps a single statement at
-    65535 bound parameters, and this table's 6 columns per row means one
-    statement maxes out around 10,922 rows -- comfortably above today's
-    ~5,000-customer cohort, but a silent landmine for a larger one. Found
-    by an independent review actually pushing a single-statement upsert
-    past that limit (`OperationalError: number of parameters must be
-    between 0 and 65535`), not by inspection. All chunks share the
-    caller's transaction (`conn` is never committed here), so a failure
-    partway through still rolls back everything, not just the failed
-    chunk.
+    65535 bound parameters, and this table's 6-8 columns per row means
+    one statement maxes out around 8,000-10,922 rows -- comfortably
+    above today's ~5,000-customer cohort, but a silent landmine for a
+    larger one. Found by an independent review actually pushing a
+    single-statement upsert past that limit (`OperationalError: number
+    of parameters must be between 0 and 65535`), not by inspection. All
+    chunks share the caller's transaction (`conn` is never committed
+    here), so a failure partway through still rolls back everything, not
+    just the failed chunk.
     """
     if not rows:
         return []
+    with_labels = "actual_churned" in rows[0]
     scored_at: list[dt.datetime] = []
     for start in range(0, len(rows), _UPSERT_CHUNK_SIZE):
         chunk = rows[start : start + _UPSERT_CHUNK_SIZE]
-        scored_at.extend(_upsert_predictions_chunk(conn, chunk))
+        scored_at.extend(_upsert_predictions_chunk(conn, chunk, with_labels))
     return scored_at

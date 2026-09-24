@@ -27,6 +27,9 @@ dependencies = [
     "uvicorn[standard]>=0.53.0",
     "prometheus-client>=0.26.0",
     "shap>=0.51.0",
+    "scipy>=1.13.0",
+    "prefect>=3.0.0",
+    "streamlit>=1.38.0",
 ]
 
 [dependency-groups]
@@ -48,14 +51,13 @@ dev = [
 # from `dependencies` per DECISIONS.md ("add dependencies per-phase
 # rather than front-loading the whole stack"). scikit-learn and mlflow
 # moved to `dependencies` in Phase 5, once src/churn/models actually
-# started importing them; shap moved in Phase 6, once
-# src/churn/models/inference.py started importing it, per this same
-# policy.
+# started importing them; shap moved in Phase 6; scipy moved in Phase 7,
+# once src/churn/monitoring started importing it (for `scipy.stats`'s KS
+# test and entropy/KL-divergence), per this same policy.
 notebooks = [
     "jupyter>=1.0.0",
     "nbconvert>=7.16.3",
     "ipykernel>=6.29.4",
-    "scipy>=1.13.0",
     "statsmodels>=0.14.1",
     "lifelines>=0.29.0",
     "matplotlib>=3.8.4",
@@ -98,10 +100,11 @@ module = ["testcontainers.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# sklearn/mlflow/shap ship no py.typed marker (as of the pinned versions
-# here) -- sklearn/mlflow first exercised in Phase 5; shap in Phase 6
-# (src/churn/models/inference.py).
-module = ["sklearn.*", "mlflow.*", "shap.*"]
+# sklearn/mlflow/shap/scipy ship no py.typed marker (as of the pinned
+# versions here) -- sklearn/mlflow first exercised in Phase 5; shap in
+# Phase 6 (src/churn/models/inference.py); scipy in Phase 7
+# (src/churn/monitoring/drift.py's `scipy.stats`).
+module = ["sklearn.*", "mlflow.*", "shap.*", "scipy.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -34,6 +34,12 @@ uv run pytest
 uv run python pipelines/train.py   # trains + registers the champion model (Phase 5)
 uv run python pipelines/batch_score.py            # scores the current cohort (Phase 6)
 uv run uvicorn api.main:app --host 0.0.0.0 --port 8000   # serves predictions (Phase 6)
+uv run python pipelines/backfill_predictions.py    # backtests every historical cohort (Phase 7)
+uv run python pipelines/monitor.py                 # logs drift + performance-decay checks (Phase 7)
+uv run streamlit run dashboards/app.py             # interactive monitoring dashboard (Phase 7)
+
+# or run the whole thing above as one orchestrated flow:
+uv run python pipelines/flows.py
 ```
 
 Equivalent `make` targets exist (`make setup`, `make db-up`, `make ingest`,
@@ -50,10 +56,11 @@ Services once `db-up` has run:
 | MinIO console | http://localhost:9001 |
 | MLflow | http://localhost:5000 |
 | Inference API (once `make serve`/uvicorn is running) | http://localhost:8000 |
+| Monitoring dashboard (once `make dashboard`/streamlit is running) | http://localhost:8501 |
 
 ## Status
 
-Phases 1–6 complete, all verified end-to-end against real containers and
+Phases 1–7 complete, all verified end-to-end against real containers and
 real notebook/pipeline execution, not just written:
 
 - **Phase 1** (infra + DB + ingestion): 7,043 customers loaded, zero
@@ -118,23 +125,45 @@ real notebook/pipeline execution, not just written:
   show) plus eight further real issues, all verified live — see
   [PLAN.md](PLAN.md#phase-6--inference-api--batch-scoring--done) and
   [DECISIONS.md](DECISIONS.md#shap-values-must-aggregate-to-source-feature-not-stay-one-hot-column-per-entry).
+- **Phase 7** (monitoring + dashboard): `pipelines/backfill_predictions.py`
+  backtests every historical cohort (82,343 rows, 17 months) with the
+  current champion, giving `src/churn/monitoring/performance.py`
+  something real to report — a genuine, honestly-labeled
+  train/validation/test performance trend, not a single number
+  (test-cohort PR-AUC 0.11–0.12, correctly lower than the partially
+  in-sample training cohorts' 0.09–0.20). `src/churn/monitoring/drift.py`
+  (PSI/KS/KL) found a real, moderate drift signal on `tenure_months`
+  (PSI 0.2179) between the training window and the live cohort — every
+  other feature stayed stable. `pipelines/flows.py` orchestrates the
+  whole pipeline (ingest → build panel → train → batch score → backfill
+  → monitor) as one Prefect flow, run end to end for real:
+  ingestion/panel-building correctly no-op'd (already up to date), a new
+  training run correctly tied the champion and was **not** promoted, and
+  every downstream stage correctly kept using the untouched champion.
+  `dashboards/app.py` (Streamlit) and `dashboards/report.py` (static
+  HTML) render the same monitoring computations interactively/for
+  sharing — the Streamlit app verified headlessly with
+  `streamlit.testing.v1.AppTest` (zero exceptions), not just a `curl`
+  against the running process. See
+  [PLAN.md](PLAN.md#phase-7--monitoring--dashboard--done) for the full
+  verification.
 
-`ruff`, `black --check`, `mypy --strict` clean on `src`, `pipelines`, and
-`api`. See [PLAN.md](PLAN.md) for the full phase breakdown, current test
-counts, and what's next.
+`ruff`, `black --check`, `mypy --strict` clean on `src`, `pipelines`,
+`api`, and `dashboards`. See [PLAN.md](PLAN.md) for the full phase
+breakdown, current test counts, and what's next.
 
 ## Repository layout
 
 ```
 config/       YAML business/pipeline config (no secrets — see .env.example)
 sql/          ddl (generated from Alembic), features (extraction queries), validation (data-quality queries)
-src/churn/    the package: config, db, ingestion, features, models (split/pipeline/registry/inference)
+src/churn/    the package: config, db, ingestion, features, models (split/pipeline/registry/inference), monitoring (drift/performance)
 alembic/      versioned schema migrations — the source of truth for the DB schema
 tests/        unit/ (no Docker needed) and integration/ (testcontainers, needs Docker)
 notebooks/    exploration only — nothing here is imported by src/
-pipelines/    train.py (Phase 5); batch_score.py (Phase 6)
+pipelines/    train.py (5), batch_score.py + backfill_predictions.py + monitor.py (6/7), flows.py (7, Prefect orchestration)
 api/          FastAPI serving layer: predictions, on-demand scoring, health, metrics (Phase 6)
-dashboards/   Streamlit app + static report generator (from Phase 7)
+dashboards/   app.py (Streamlit) + report.py (static HTML, writes to reports/, gitignored) (Phase 7)
 ```
 
 Further sections (architecture diagram, design decisions summary, known

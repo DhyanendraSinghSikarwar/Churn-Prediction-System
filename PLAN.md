@@ -453,11 +453,101 @@ next starts.
     review — and a real `decimal.Decimal` in the `/predictions` test
     fixture, which the original test's plain `float` never exercised).
 
-### Phase 7 — Monitoring + dashboard — Not started
+### Phase 7 — Monitoring + dashboard — **DONE**
 
-- `src/churn/monitoring/` (PSI/KS/KL drift, delayed-label performance
-  decay), Prefect DAGs, `dashboards/` Streamlit app + static report
-  generator.
+- `src/churn/monitoring/drift.py` — PSI, two-sample KS, and KL
+  divergence between a reference feature distribution and a comparison
+  one, for both numeric (quantile-binned) and categorical (category-
+  proportion) features. `drift_report()` classifies each feature
+  stable/moderate/significant against `config.yaml`'s
+  `psi_warning_threshold`/`psi_critical_threshold`.
+- `src/churn/monitoring/performance.py` — `cohort_performance_report()`
+  computes PR-AUC/ROC-AUC/precision/recall *per cohort*
+  (`reference_date`), not one pooled number, from `predictions` rows
+  whose label has matured. Every cohort is labeled
+  train/validation/test/post-test (`models.split.dataset_split_label`,
+  factored out of `time_based_split`'s boundary math) so an in-sample
+  cohort's numbers can never be mistaken for held-out performance.
+- `pipelines/backfill_predictions.py` — scores every historical cohort
+  with the current champion and backfills `actual_churned` from the
+  already-matured `feature_snapshots.label_churn_next_30d`. A
+  retrospective backtest (most cohorts are partially in-sample), not a
+  live signal — see
+  [DECISIONS.md#backfill-predictions-scores-historical-cohorts-as-a-retrospective-backtest](DECISIONS.md#backfill-predictions-scores-historical-cohorts-as-a-retrospective-backtest).
+  This is what gives the performance-decay report something real to
+  show; without it `predictions` only ever holds the current,
+  label-not-matured-yet cohort.
+- `pipelines/monitor.py` — the scheduled, read-only check: logs a
+  structured line per feature (drift) and per cohort (performance),
+  warning-level for anything crossing a drift threshold. Computes
+  everything fresh from Postgres + the registry every run — no new
+  "monitoring_runs" table; see
+  [DECISIONS.md#monitoring-results-are-computed-on-demand-not-persisted](DECISIONS.md#monitoring-results-are-computed-on-demand-not-persisted).
+- `dashboards/app.py` — Streamlit, three tabs (current cohort overview,
+  feature drift, performance over time), reading live from Postgres +
+  MLflow on every render, same `churn.monitoring` functions
+  `pipelines/monitor.py` logs.
+- `dashboards/report.py` — a static, self-contained HTML report (tables
+  + inline CSS, no new charting dependency) for sharing without a
+  running Streamlit server — writes to `reports/` (gitignored,
+  reproducible on demand).
+- `pipelines/flows.py` — a Prefect flow (`churn_pipeline_flow`)
+  sequencing ingest → build panel → train → batch score → backfill →
+  monitor. Every task shells out to the exact CLI command
+  README/Makefile already document, rather than importing `run()`
+  in-process — see
+  [DECISIONS.md#prefect-tasks-shell-out-to-the-existing-cli-scripts-not-in-process-imports](DECISIONS.md#prefect-tasks-shell-out-to-the-existing-cli-scripts-not-in-process-imports).
+- **Verify — run against the real Postgres + MLflow server, not just
+  written:**
+  - `backfill_predictions.py`: scored all **82,343** historical rows
+    across **17** monthly cohorts with champion v3, including
+    per-row SHAP (same aggregation Phase 6's review fixed — verified it
+    scales to ~16x batch_score.py's row count in one vectorized call,
+    ~46s total).
+  - `monitor.py`: a real, interesting finding, not a synthetic example —
+    `tenure_months` came back **PSI 0.2179 (moderate)** between the
+    training window and the current cohort; every other feature stayed
+    stable (PSI < 0.05). Per-cohort performance showed the honestly
+    lower, genuinely held-out test-window numbers (PR-AUC 0.1148 /
+    0.1173 for the two test cohorts) against the higher, partially
+    in-sample training-cohort numbers (PR-AUC 0.09–0.20) — exactly the
+    "don't conflate in-sample with held-out" discipline
+    `dataset_split_label` exists to enforce, confirmed with real numbers
+    rather than asserted.
+  - `dashboards/app.py`: verified headlessly with
+    `streamlit.testing.v1.AppTest` (not just a `curl` against the
+    running server, which only proves the process is up, never that the
+    script executes without exceptions — Streamlit renders per
+    websocket session) — zero exceptions, 3 metrics/3 tabs/3
+    dataframes/3 captions all rendered with the real live numbers
+    (5,174 scored, 588 high risk, champion v3).
+  - `dashboards/report.py`: generated a real static report against live
+    data; spot-checked the drift table's severity highlighting and the
+    performance table's dataset-split labels render correctly.
+  - `pipelines/flows.py`: ran the full flow end to end for real
+    (`uv run python pipelines/flows.py`) — all 6 tasks completed in the
+    correct dependency order (ingest and build-panel correctly
+    no-op'd, already up to date; train produced a new, seeded-identical
+    version (v4, test PR-AUC 0.10932458317915489, tied v3, correctly
+    *not* promoted); batch_score/backfill_predictions/monitor then
+    correctly used the still-current champion, v3, not the untested v4
+    — proving the flow doesn't just run tasks in order but that each
+    stage's *output* correctly feeds the next). One benign artifact
+    surfaced: a `sqlite3 database is locked` traceback from Prefect's
+    own local telemetry backend at startup, unrelated to this project's
+    Postgres and not fatal to the run (every task still completed, exit
+    code 0) — see CLAUDE.md's Gotchas.
+  - `shap` moved from the `notebooks` group to `dependencies` (same
+    per-phase policy); `scipy` moved likewise (Phase 7's first
+    `src/churn`-side use, in `drift.py`'s KS test / KL divergence);
+    `prefect`/`streamlit` added new.
+  - New unit tests: 14 for `monitoring/` (PSI/KS/KL correctness on
+    synthetic known-shift distributions, severity classification,
+    dataset-split-label boundaries, precision/recall-at-risk-band
+    arithmetic, NaN handling for single-class cohorts) plus a
+    `MonitoringConfig` validator test. `ruff`, `black --check`,
+    `mypy --strict` clean on `src`, `pipelines`, `api`, and `dashboards`
+    (lint scope widened again to include the new directory).
 
 ### Phase 8 — Tests, CI, docs — Not started
 

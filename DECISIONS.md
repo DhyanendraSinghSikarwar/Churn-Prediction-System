@@ -1317,3 +1317,115 @@ acted on for now:
   row) depends on per-row ordering — but `upsert_predictions`'s
   docstring was softened to describe that equivalence instead of
   claiming an order guarantee Postgres doesn't actually make.
+
+## Phase 7 — Monitoring + Dashboard (2026-09-24)
+
+### backfill-predictions-scores-historical-cohorts-as-a-retrospective-backtest
+
+**Situation:** Before this phase, `predictions` only ever held rows for
+the *current* scoring cohort (`batch_score.py`, `reference_date ==
+snapshot_date`) — a single point in time, with no ground truth yet
+(the label hasn't matured). `src/churn/monitoring/performance.py`'s
+whole purpose (show performance *decay over time*, not one number) needs
+multiple cohorts, each with a known outcome, to compute anything.
+
+**Decision:** `pipelines/backfill_predictions.py` scores every
+historical cohort (`models.split.modeling_panel` — every
+`feature_snapshots` row before `snapshot_date`) with the current
+champion, and upserts `actual_churned` (straight from
+`feature_snapshots.label_churn_next_30d`, already matured) alongside the
+usual probability/risk_band/shap_top3. This is explicitly a
+**retrospective backtest**, not a live monitoring signal — most of these
+cohorts were part of the champion's own training data, so "performance"
+on them is (partially) in-sample. `models.split.dataset_split_label`
+(new, factored out of `time_based_split`'s boundary math so both share
+one implementation) labels every cohort train/validation/test/post-test
+specifically so this distinction is never lost downstream — a
+train-window cohort's optimistic numbers must never be read as if they
+were the held-out test score, the same discipline
+DECISIONS.md#groupkfold-cv-score-is-not-comparable-to-forward-in-time-pr-auc
+already applies to CV scores.
+
+**Rejected alternative:** waiting for "real" time to pass and only ever
+scoring the current cohort, the way a production system with an
+advancing clock would. Not possible here — `snapshot_date` is a fixed
+anchor in this synthetic world (DECISIONS.md's Phase 1 section), so
+there is no future to wait for. Backtesting against already-known
+historical outcomes is the only way this demo can show a genuine
+multi-period performance trend at all.
+
+### monitoring-results-are-computed-on-demand-not-persisted
+
+**Situation:** Feature drift (`src/churn/monitoring/drift.py`) and
+delayed-label performance (`src/churn/monitoring/performance.py`) are
+both cheap to compute from data that's already durable
+(`feature_snapshots`, `predictions`) — recomputing either from scratch
+is a sub-second-to-few-seconds query + pandas/sklearn call, not an
+expensive external computation.
+
+**Decision:** No new `drift_reports`/`monitoring_runs` table. Both
+`pipelines/monitor.py` (the scheduled check, logs findings) and
+`dashboards/app.py`/`dashboards/report.py` (interactive/static views)
+call the exact same `churn.monitoring` functions fresh, every time,
+straight from Postgres + the MLflow registry. One computation path, no
+risk of a persisted report drifting from what the underlying data
+actually says by the time someone reads it.
+
+**Rejected alternative:** a table recording each monitoring run's
+results, for historical trend charts without recomputing. Rejected
+for now — recomputing a full historical trend (every cohort,
+every feature) is already fast enough at this data's scale (~87k
+historical feature rows, low thousands of predictions) that persistence
+would add write-path complexity and a second source of truth to keep in
+sync, for a performance problem that doesn't exist yet. Revisit if the
+panel grows large enough that live recomputation becomes slow, or if
+alerting needs a persisted history to diff against.
+
+### prefect-tasks-shell-out-to-the-existing-cli-scripts-not-in-process-imports
+
+**Situation:** `pipelines/flows.py` needs to run ingestion, panel
+building, training, batch scoring, backfilling, and monitoring as one
+ordered, retryable Prefect flow. `ingestion.cli.run()` and
+`features.build_panel.run()` already live in `src/churn` and are
+importable; `train.py`/`batch_score.py`/`backfill_predictions.py`'s
+`run()` functions, by contrast, live directly in their `pipelines/`
+script files (an inconsistency that emerged across phases — Phase 1/2
+put entry logic in `src/churn`, Phase 5/6 put it directly in
+`pipelines/`), so importing them into `flows.py` cleanly would mean
+either restructuring already-verified Phase 5/6 code or accepting an
+ad hoc same-directory import.
+
+**Decision:** Every Prefect task shells out to the exact command this
+project's own README/Makefile already document (e.g.
+`uv run python pipelines/train.py`, via `subprocess.run`), rather than
+importing and calling `run()` in-process. Prefect's job here is purely
+sequencing/retries/observability — never a second place pipeline logic
+lives, and every stage stays exactly as independently runnable as
+before (`uv run python pipelines/train.py` behaves identically whether
+or not the Prefect flow ever runs it).
+
+**Rejected alternative:** refactoring `train.py`/`batch_score.py`/
+`backfill_predictions.py`'s `run()` functions into `src/churn/pipelines/`
+first (matching `ingestion`/`build_panel`'s existing pattern), so
+`flows.py` could import and call them directly like Prefect flows
+conventionally do. This is the architecturally tidier option and worth
+doing eventually, but it means touching three already-built,
+already-reviewed files for a consistency improvement, not a
+demonstrated defect — deferred rather than risking regressions in
+verified Phase 5/6 code this late in the project for a refactor the
+subprocess approach makes merely "less elegant," not incorrect.
+
+### shap-top3-backfill-reuses-the-exact-same-aggregation-fixed-in-phase-6-review
+
+**Situation:** `backfill_predictions.py` computes `shap_top3` for
+~82,343 historical rows via the same `shap_top_features()` used by
+`batch_score.py`'s ~5,174-row current cohort — the function that Phase
+6's post-review fix corrected to aggregate one-hot columns back to
+source features (DECISIONS.md#shap-values-must-aggregate-to-source-feature-not-stay-one-hot-column-per-entry).
+
+**Decision:** No separate computation path for the historical backfill
+— same function, same background sample, same aggregation. Verified
+this scales to ~16x the row count without a rewrite: `shap.LinearExplainer`'s
+cost is linear in row count (not the model-inference-heavy cost a tree
+explainer would have), so the existing vectorized call handles the
+whole historical panel in one pass.

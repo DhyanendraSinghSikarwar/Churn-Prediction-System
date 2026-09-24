@@ -69,6 +69,11 @@ def cfg() -> AppConfig:
                 "offer_success_rate": 0.30,
                 "risk_bands": {"low_max": 0.3, "medium_max": 0.7},
             },
+            "monitoring": {
+                "psi_warning_threshold": 0.1,
+                "psi_critical_threshold": 0.25,
+                "drift_bins": 10,
+            },
         }
     )
 

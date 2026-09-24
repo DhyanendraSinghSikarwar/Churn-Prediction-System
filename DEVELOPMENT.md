@@ -1,13 +1,13 @@
 # DEVELOPMENT.md
 
 Step-by-step build log: every command actually run to get this repo from
-an empty clone to its current state (Phases 1–6), in order, so it can be
+an empty clone to its current state (Phases 1–7), in order, so it can be
 reproduced from scratch. This is the "how to run it" doc — see
 [PLAN.md](PLAN.md) for what each phase produced and the verified numbers,
 [DECISIONS.md](DECISIONS.md) for why each non-obvious call was made, and
 [CLAUDE.md](CLAUDE.md) for the condensed command/gotcha reference used
 day to day. This file is maintained phase by phase as the project grows;
-it will cover Phases 7–8 as they're built.
+it will cover Phase 8 once it's built.
 
 ## Prerequisites
 
@@ -227,6 +227,78 @@ Full verification: [PLAN.md#phase-6](PLAN.md).
 > for the exact script and reasoning. This is a one-time situation —
 > every training run from Phase 6 onward logs the artifact by
 > construction.
+
+## Phase 7 — Monitoring + dashboard
+
+Requires Phase 6's champion + `predictions` table already populated
+(`batch_score.py` at least once).
+
+```bash
+uv run python pipelines/backfill_predictions.py
+```
+
+Scores every *historical* cohort (every `feature_snapshots` row before
+`snapshot_date`, i.e. everything `batch_score.py`'s current-cohort run
+doesn't touch) with the current champion, and backfills
+`actual_churned` straight from the already-matured
+`feature_snapshots.label_churn_next_30d` — this is a retrospective
+backtest (most cohorts were part of the champion's own training data),
+not a live signal, but it's what gives the next command something real
+to report on. Idempotent, same as `batch_score.py`.
+
+```bash
+uv run python pipelines/monitor.py
+```
+
+Logs two reports: feature drift (training window vs. current cohort —
+PSI/KS/KL per feature, warning-level if PSI crosses
+`config.yaml`'s `psi_warning_threshold`/`psi_critical_threshold`) and
+delayed-label performance decay (PR-AUC/ROC-AUC/precision/recall *per
+historical cohort*, each labeled train/validation/test/post-test so an
+in-sample cohort's numbers are never mistaken for held-out
+performance). Read-only — computes fresh from Postgres + the registry
+every run, never writes anything back.
+
+```bash
+uv run streamlit run dashboards/app.py
+# open http://localhost:8501 -- three tabs: current cohort, feature
+# drift, performance over time
+```
+
+```bash
+uv run python dashboards/report.py
+# writes reports/monitoring_report.html (gitignored) -- the same
+# computations as monitor.py/app.py, captured as a shareable static file
+```
+
+```bash
+uv run python pipelines/flows.py
+# runs the whole pipeline (ingest -> build panel -> train -> batch
+# score -> backfill -> monitor) as one Prefect flow, in order
+```
+
+```bash
+uv run pytest                                                                                  # 81/81 incl. Phase 7 unit tests
+uv run ruff check src tests pipelines api dashboards && uv run black --check src tests pipelines api dashboards && uv run mypy src pipelines api dashboards   # lint clean
+```
+
+Verify: backfilled 82,343 rows across 17 cohorts; `tenure_months` came
+back with real, moderate drift (PSI 0.2179) between the training window
+and the current cohort, every other feature stable; per-cohort
+performance honestly showed lower PR-AUC on the genuine held-out test
+cohorts (0.11–0.12) than on the partially in-sample training cohorts
+(0.09–0.20); the full Prefect flow ran end to end for real, each stage's
+output correctly feeding the next (a tied, non-promoted retrain
+correctly left every downstream stage using the untouched champion).
+Full verification: [PLAN.md#phase-7](PLAN.md).
+
+> **Testing `dashboards/app.py` headlessly**: `curl`ing the running
+> Streamlit server only proves the process is up — Streamlit executes
+> the actual script per websocket session, so that alone can't catch an
+> exception in the render code. Use
+> `streamlit.testing.v1.AppTest.from_file(<absolute path>)` (`.run()`,
+> then inspect `.exception`/`.metric`/`.dataframe`/etc.) for a real
+> headless functional check instead.
 
 ---
 

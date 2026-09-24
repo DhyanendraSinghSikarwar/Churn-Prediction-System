@@ -18,6 +18,10 @@ htmlcov/
 data/raw/
 artifacts/
 
+# Generated reports (dashboards/report.py) -- reproducible from Postgres
+# + the MLflow registry on demand, not a source artifact.
+reports/
+
 # Jupyter
 .ipynb_checkpoints/
 

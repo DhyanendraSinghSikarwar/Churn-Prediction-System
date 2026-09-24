@@ -125,6 +125,20 @@ class BusinessConfig(BaseModel):
     risk_bands: RiskBandsConfig
 
 
+class MonitoringConfig(BaseModel):
+    psi_warning_threshold: float = Field(gt=0)
+    psi_critical_threshold: float = Field(gt=0)
+    drift_bins: int = Field(gt=1)
+
+    @field_validator("psi_critical_threshold")
+    @classmethod
+    def _critical_after_warning(cls, v: float, info: ValidationInfo) -> float:
+        warning = info.data.get("psi_warning_threshold")
+        if warning is not None and v <= warning:
+            raise ValueError("psi_critical_threshold must be greater than psi_warning_threshold")
+        return v
+
+
 class AppConfig(BaseModel):
     """Business / pipeline configuration loaded from config/config.yaml.
     Contains no secrets — see Settings for those."""
@@ -134,6 +148,7 @@ class AppConfig(BaseModel):
     feature_set: FeatureSetConfig
     mlflow: MLflowConfig
     business: BusinessConfig
+    monitoring: MonitoringConfig
 
 
 def load_app_config(path: Path | str = PROJECT_ROOT / "config" / "config.yaml") -> AppConfig:
