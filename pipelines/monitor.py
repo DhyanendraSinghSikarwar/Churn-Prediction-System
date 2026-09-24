@@ -5,16 +5,22 @@ finding) -- the read-only observability step the Prefect flow
 (`pipelines/flows.py`) runs after `batch_score.py`/`backfill_predictions.py`:
 
 1. **Feature drift**: the training window's feature distribution
-   (reference) vs. the current scoring cohort's (comparison), via
-   `churn.monitoring.drift.drift_report`. Logs a warning for any feature
-   whose PSI crosses `config.yaml`'s `psi_warning_threshold`/
-   `psi_critical_threshold`.
+   (reference -- train+val, exactly what the champion was fit on, see
+   `churn.models.split.trainval_split`) vs. the current scoring cohort's
+   (comparison), via `churn.monitoring.drift.drift_report`. Logs a
+   warning for any feature whose severity comes back "moderate",
+   "significant", or "unknown" (the last meaning PSI couldn't even be
+   computed -- e.g. a feature that's gone entirely null -- which is
+   itself worth a human looking at, not quietly logged at info level).
 2. **Delayed-label performance decay**: every already-matured
    `predictions` cohort scored by the *current* champion (populated by
    `backfill_predictions.py`), via
    `churn.monitoring.performance.cohort_performance_report` -- logged per
    cohort so a real PR-AUC/precision/recall trend over time is visible,
-   not just today's number.
+   not just today's number. Each cohort's `in_sample` flag is logged
+   alongside its split label: train/validation cohorts were literally
+   part of what the champion was fit on, so their numbers are optimistic
+   by construction, not just "partially" so.
 
 Read-only: computes and logs, never writes anything back to Postgres.
 `dashboards/app.py` runs these exact same functions on demand for the
@@ -29,44 +35,22 @@ import sys
 
 import mlflow
 import pandas as pd
-from mlflow.tracking import MlflowClient
-from sqlalchemy import text
 
 from churn.config import AppConfig, get_app_config
-from churn.db.engine import get_engine
-from churn.models.inference import current_champion_version, scoring_cohort
+from churn.models.inference import scoring_cohort
 from churn.models.pipeline import load_selected_features
-from churn.models.split import modeling_panel, time_based_split
+from churn.models.split import modeling_panel, trainval_split
 from churn.monitoring.drift import drift_report
+from churn.monitoring.loaders import champion_version, load_matured_predictions, load_panel
 from churn.monitoring.performance import cohort_performance_report
 from churn.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
 
-
-def _load_panel(cfg: AppConfig) -> pd.DataFrame:
-    engine = get_engine()
-    df = pd.read_sql(
-        text("SELECT * FROM feature_snapshots WHERE feature_set_version = :v"),
-        engine,
-        params={"v": cfg.feature_set.version},
-    )
-    df["reference_date"] = pd.to_datetime(df["reference_date"])
-    return df
-
-
-def _load_matured_predictions(cfg: AppConfig, model_version: str) -> pd.DataFrame:
-    engine = get_engine()
-    df = pd.read_sql(
-        text(
-            "SELECT reference_date, probability, risk_band, actual_churned FROM predictions "
-            "WHERE model_version = :v AND actual_churned IS NOT NULL"
-        ),
-        engine,
-        params={"v": model_version},
-    )
-    df["reference_date"] = pd.to_datetime(df["reference_date"])
-    return df
+# Severities worth a human looking at -- "unknown" means the drift check
+# itself couldn't run (e.g. a feature gone entirely null), which is at
+# least as concerning as a measured shift, not less.
+_WARN_SEVERITIES = {"moderate", "significant", "unknown"}
 
 
 def _check_drift(panel: pd.DataFrame, cfg: AppConfig) -> None:
@@ -75,12 +59,12 @@ def _check_drift(panel: pd.DataFrame, cfg: AppConfig) -> None:
         logger.warning("drift_check_skipped_no_current_cohort")
         return
 
-    train_df, _, _ = time_based_split(modeling_panel(panel, cfg), cfg)
+    reference = trainval_split(modeling_panel(panel, cfg), cfg)
     selected_features = load_selected_features(cfg)
-    results = drift_report(train_df, current_cohort, selected_features, cfg)
+    results = drift_report(reference, current_cohort, selected_features, cfg)
 
     for result in results:
-        log = logger.warning if result.severity in {"moderate", "significant"} else logger.info
+        log = logger.warning if result.severity in _WARN_SEVERITIES else logger.info
         log(
             "feature_drift",
             feature=result.feature,
@@ -92,23 +76,21 @@ def _check_drift(panel: pd.DataFrame, cfg: AppConfig) -> None:
                 if result.kl_divergence == result.kl_divergence
                 else None
             ),
+            reference_null_rate=round(result.reference_null_rate, 4),
+            current_null_rate=round(result.current_null_rate, 4),
             severity=result.severity,
         )
 
 
 def _check_performance(cfg: AppConfig) -> None:
-    client = MlflowClient()
-    try:
-        model_version = current_champion_version(cfg.mlflow.registry_model_name, client)
-    except Exception:
-        logger.warning("performance_check_skipped_champion_unavailable", exc_info=True)
+    version = champion_version(cfg)
+    if version is None:
+        logger.warning("performance_check_skipped_champion_unavailable")
         return
 
-    predictions = _load_matured_predictions(cfg, model_version)
+    predictions = load_matured_predictions(cfg, version)
     if predictions.empty:
-        logger.warning(
-            "performance_check_skipped_no_matured_predictions", model_version=model_version
-        )
+        logger.warning("performance_check_skipped_no_matured_predictions", model_version=version)
         return
 
     for cohort in cohort_performance_report(predictions, cfg):
@@ -116,6 +98,7 @@ def _check_performance(cfg: AppConfig) -> None:
             "cohort_performance",
             reference_date=str(cohort.reference_date),
             dataset_split=cohort.dataset_split,
+            in_sample=cohort.in_sample,
             n=cohort.n,
             positive_rate=round(cohort.positive_rate, 4),
             pr_auc=round(cohort.pr_auc, 4) if cohort.pr_auc == cohort.pr_auc else None,
@@ -129,7 +112,7 @@ def run() -> None:
     cfg = get_app_config()
     mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
 
-    panel = _load_panel(cfg)
+    panel = load_panel(cfg)
     _check_drift(panel, cfg)
     _check_performance(cfg)
 

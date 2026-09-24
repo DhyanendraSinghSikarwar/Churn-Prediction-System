@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from churn.config import AppConfig
-from churn.models.split import modeling_panel, time_based_split
+from churn.models.split import modeling_panel, time_based_split, trainval_split
 
 
 @pytest.fixture
@@ -58,6 +58,7 @@ def cfg() -> AppConfig:
                 "psi_warning_threshold": 0.1,
                 "psi_critical_threshold": 0.25,
                 "drift_bins": 10,
+                "null_rate_delta_threshold": 0.1,
             },
         }
     )
@@ -111,3 +112,13 @@ def test_time_based_split_shrinks_when_censored_cohort_already_dropped(cfg: AppC
     filtered = modeling_panel(panel, cfg)
     _, _, test = time_based_split(filtered, cfg)
     assert len(test) == 2
+
+
+def test_trainval_split_matches_train_plus_val_from_time_based_split(cfg: AppConfig) -> None:
+    panel = _panel_with_monthly_cohorts(dt.date(2023, 1, 1), dt.date(2024, 5, 1))
+    train, val, _ = time_based_split(panel, cfg)
+
+    trainval = trainval_split(panel, cfg)
+
+    assert len(trainval) == len(train) + len(val)
+    assert set(trainval["customer_id"]) == set(train["customer_id"]) | set(val["customer_id"])

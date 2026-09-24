@@ -32,7 +32,6 @@ import sys
 import mlflow
 import pandas as pd
 from mlflow.tracking import MlflowClient
-from sqlalchemy import text
 
 from churn.config import AppConfig, get_app_config
 from churn.db.engine import get_engine
@@ -45,20 +44,14 @@ from churn.models.inference import (
 )
 from churn.models.pipeline import load_selected_features
 from churn.models.split import modeling_panel
+from churn.monitoring.loaders import load_panel
 from churn.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
 
 
 def _load_historical_panel(cfg: AppConfig) -> pd.DataFrame:
-    engine = get_engine()
-    df = pd.read_sql(
-        text("SELECT * FROM feature_snapshots WHERE feature_set_version = :v"),
-        engine,
-        params={"v": cfg.feature_set.version},
-    )
-    df["reference_date"] = pd.to_datetime(df["reference_date"])
-    return modeling_panel(df, cfg)
+    return modeling_panel(load_panel(cfg), cfg)
 
 
 def run() -> None:
@@ -83,7 +76,14 @@ def run() -> None:
     probabilities = [round(float(p), 5) for p in champion.pipeline.predict_proba(features)[:, 1]]
     shap_values = shap_top_features(champion, features)
     bands = [risk_band(p, cfg) for p in probabilities]
-    matured_at = pd.Timestamp.now("UTC").to_pydatetime()
+    # label_matured_at is when the label *actually* matured
+    # (reference_date + the prediction horizon) -- an objective fact
+    # about the label, not "whenever this backfill happened to run".
+    # Using now() here (the original Phase 7 implementation) meant
+    # re-running the backfill rewrote every row's label_matured_at to a
+    # fresh "now", every time -- found by an independent review. This
+    # version is a true no-op on that column across reruns.
+    horizon = pd.Timedelta(days=cfg.data.prediction_horizon_days)
 
     rows: list[PredictionRow] = [
         {
@@ -94,7 +94,7 @@ def run() -> None:
             "risk_band": band,
             "shap_top3": shap,
             "actual_churned": bool(label),
-            "label_matured_at": matured_at,
+            "label_matured_at": (reference_date + horizon).tz_localize("UTC").to_pydatetime(),
         }
         for customer_id, reference_date, probability, band, shap, label in zip(
             panel["customer_id"],

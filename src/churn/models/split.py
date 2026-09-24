@@ -58,6 +58,23 @@ def time_based_split(
     return train, val, test
 
 
+def trainval_split(panel: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
+    """The train+val rows combined -- exactly what `pipelines/train.py`
+    actually fits the champion on (`trainval_df = pd.concat([train_df, val_df])`).
+
+    Phase 7's monitoring uses this (not `time_based_split`'s train-only
+    return value) as the "reference" distribution for feature drift --
+    comparing against what the model *saw*, not an arbitrary slice of
+    it. An independent review found the original Phase 7 code compared
+    against train-only, which both understates the reference window's
+    size and (for a feature like tenure that drifts gradually within the
+    training window itself) can overstate apparent drift against the
+    current cohort. See DECISIONS.md's Phase 7 post-review section.
+    """
+    train, val, _ = time_based_split(panel, cfg)
+    return pd.concat([train, val])
+
+
 def dataset_split_label(reference_date: pd.Timestamp, cfg: AppConfig) -> str:
     """Which of train/validation/test/post-test a single `reference_date`
     falls into, using the exact same boundaries as `time_based_split` --

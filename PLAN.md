@@ -504,16 +504,20 @@ next starts.
     per-row SHAP (same aggregation Phase 6's review fixed — verified it
     scales to ~16x batch_score.py's row count in one vectorized call,
     ~46s total).
-  - `monitor.py`: a real, interesting finding, not a synthetic example —
-    `tenure_months` came back **PSI 0.2179 (moderate)** between the
-    training window and the current cohort; every other feature stayed
-    stable (PSI < 0.05). Per-cohort performance showed the honestly
-    lower, genuinely held-out test-window numbers (PR-AUC 0.1148 /
-    0.1173 for the two test cohorts) against the higher, partially
-    in-sample training-cohort numbers (PR-AUC 0.09–0.20) — exactly the
-    "don't conflate in-sample with held-out" discipline
-    `dataset_split_label` exists to enforce, confirmed with real numbers
-    rather than asserted.
+  - `monitor.py`: `tenure_months` came back **PSI 0.1881 (moderate)**
+    between the training window (train+val — see the post-review fix
+    below) and the current cohort; every other feature stayed stable
+    (PSI < 0.06). Per-cohort performance showed the honestly lower
+    `in_sample=False` (held-out) test-window numbers (PR-AUC 0.1148 /
+    0.1173 for the two test cohorts) against the higher `in_sample=True`
+    training-cohort numbers (PR-AUC 0.09–0.20) — exactly the "don't
+    conflate in-sample with held-out" discipline `dataset_split_label`
+    exists to enforce, confirmed with real numbers rather than asserted.
+    (Numbers here are post-review-fix — see below for what changed and
+    why; the original run's numbers were both real and honestly
+    reported, but a later review found the drift check itself had a
+    real blind spot and the reference window undercounted what the
+    model was fit on — both fixed before Phase 8 started.)
   - `dashboards/app.py`: verified headlessly with
     `streamlit.testing.v1.AppTest` (not just a `curl` against the
     running server, which only proves the process is up, never that the
@@ -548,6 +552,63 @@ next starts.
     `MonitoringConfig` validator test. `ruff`, `black --check`,
     `mypy --strict` clean on `src`, `pipelines`, `api`, and `dashboards`
     (lint scope widened again to include the new directory).
+- **Independently reviewed post-hoc** (a fresh agent, no prior context,
+  briefed to be adversarial, with Docker access to verify live) before
+  Phase 8 started — the same process Phase 4 and Phase 6 went through.
+  No blocker, but a real finding that silently defeated drift detection
+  on exactly the low-cardinality features this project selected, plus
+  several further real issues, all fixed and re-verified live — see
+  [DECISIONS.md#drift-binning-must-fall-back-to-exact-values-for-low-cardinality-features](DECISIONS.md#drift-binning-must-fall-back-to-exact-values-for-low-cardinality-features)
+  for the full list:
+  - **The finding**: `_numeric_bin_proportions` quantile-binned every
+    numeric feature; for `frequency_charges_90d` (~91% of rows at one
+    value), that collapsed to ~2 bins with nearly all mass of both
+    distributions in the same catch-all bucket — PSI/KL read ~0 no
+    matter how much `current` had actually shifted within it. Fixed by
+    falling back to exact per-value bins whenever a numeric feature has
+    `bins` or fewer distinct values. Re-verified live: this feature's
+    PSI went from 0.0014 to **0.051** — real, if still modest, drift
+    that was previously invisible.
+  - The original `tenure_months` "real, interesting finding" (PSI
+    0.2179) was itself softened on review: it used train-only as the
+    reference window when the champion is actually fit on train+val,
+    and much of the number is explained by tenure rising mechanically
+    as the same largely-overlapping customers age across the pooled
+    reference window, not a clean population-drift signal. Fixed the
+    reference window (`models.split.trainval_split`, new); re-verified
+    live at **PSI 0.1881** — matching the reviewer's own independent
+    measurement of the same fix exactly.
+  - A real, latent double-counting bug (the "current cohort" dashboard/
+    report queries didn't filter by champion `model_version`, so the
+    *next* promotion would double-count every current-cohort summary),
+    a performance-report metric that trusted a possibly-stale stored
+    column instead of recomputing from current config, a null-rate
+    blind spot (every drift metric drops nulls before comparing, so a
+    feature going 0%→100% null read merely "unknown" at info level),
+    two real Prefect gaps (no `cwd` on subprocess calls, no captured
+    child output in Prefect's own logs), a non-idempotent retry risk on
+    the training task, and a `label_matured_at` column that was
+    rewritten to "now" on every backfill rerun instead of recording the
+    label's actual maturity date — all fixed; see DECISIONS.md's Phase 7
+    post-review section for each one in full.
+  - Confirmed clean/ruled out (verified live, not assumed): the Prefect
+    flow genuinely halts on a task failure rather than silently
+    continuing (built a standalone reproduction with the identical task
+    pattern and confirmed it); SQL injection surface across every new
+    query; the `time_based_split`/`dataset_split_label` boundary refactor
+    changed no existing behavior (26 dates checked, 0 mismatches); the
+    dashboard and static report agree on every number for the same live
+    data.
+  - Re-ran `backfill_predictions.py`, `monitor.py`, and
+    `dashboards/report.py` against the real data after every fix;
+    re-verified the dashboard headlessly with `AppTest` again (zero
+    exceptions). 92/92 tests passing (11 new: 5 drift regression tests,
+    2 performance-report tests, 1 split test, 3 new testcontainers
+    integration tests proving the labeled/unlabeled upsert conflict
+    paths never cross-clobber each other — a real gap in Phase 7's
+    original test coverage the review found, since a fresh INSERT can't
+    distinguish a correct branch selection from a lucky one, only a
+    second upsert on the same key can).
 
 ### Phase 8 — Tests, CI, docs — Not started
 

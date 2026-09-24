@@ -1429,3 +1429,220 @@ this scales to ~16x the row count without a rewrite: `shap.LinearExplainer`'s
 cost is linear in row count (not the model-inference-heavy cost a tree
 explainer would have), so the existing vectorized call handles the
 whole historical panel in one pass.
+
+## Phase 7 post-review fixes (2026-09-24)
+
+An independent review agent (fresh context, briefed to be adversarial,
+given Docker access to verify live rather than just read code) reviewed
+Phase 7 before Phase 8 started — the same process Phase 4 and Phase 6
+went through. It found no blocker but several real issues, all verified
+live, most notably one that silently defeated drift detection on the
+exact features this project selected. Fixed all of them; re-verified
+live afterward.
+
+### drift-binning-must-fall-back-to-exact-values-for-low-cardinality-features
+
+**Situation:** `_numeric_bin_proportions` quantile-binned every numeric
+feature, reference-derived edges collapsed to `np.unique(...)`. For a
+low-cardinality, skewed count feature — `frequency_charges_90d`, ~91%
+of rows at a single value, matching the reviewer's live measurement —
+this collapsed to as few as 2 bins, with nearly all mass of *both*
+distributions landing in the same `-inf..X` catch-all bucket. PSI/KL
+came back ~0.0 regardless of how much `current` had actually shifted
+within that bucket — silently, no error, just a wrong "stable" reading
+on exactly the kind of feature this project's SQL feature-extraction
+tends to produce (bounded counts over a rolling window).
+
+**Decision:** `_numeric_bin_proportions` now falls back to exact
+per-value bins (the same function categorical features already use)
+whenever `reference` has `bins` or fewer distinct values — a low
+integer count can't collapse that way, since every distinct value is
+always its own bucket regardless of skew. Doesn't solve the fully
+general case (a genuinely continuous but heavily skewed feature with
+*more* distinct values than `bins` could still see quantile edges bunch
+up) — not attempted; revisit if a feature like that is ever selected.
+Also added `reference_null_rate`/`current_null_rate` to `FeatureDrift`
+and a `null_rate_delta_threshold` config: every PSI/KS/KL computation
+drops nulls before comparing, so a feature whose *null rate* spiked
+(the reviewer's example: 0% to 100% null) previously came back merely
+"unknown" (PSI undefined) and logged at info level — the least visible
+outcome for the most serious data failure a feature can have. A
+null-rate jump past the threshold is now flagged "significant" on its
+own, and `pipelines/monitor.py` logs "unknown"/"significant"/"moderate"
+all at warning.
+
+### drift-reference-window-must-be-train-plus-val-not-train-only
+
+**Situation:** `pipelines/monitor.py`/`dashboards/app.py`/
+`dashboards/report.py` all compared the current cohort against
+`time_based_split(...)`'s train-only return value, but
+`pipelines/train.py` actually fits the champion on train+val combined
+(`trainval_df = pd.concat([train_df, val_df])`) — comparing against a
+narrower window than what the model was actually built from. The
+reviewer also measured, with this project's own `drift_report`, how
+sensitive the previously-reported `tenure_months` PSI (0.2179,
+described in PLAN.md/README.md as "a real, interesting finding") is to
+this choice: train-only 0.2179, train+val 0.1881, last-train-cohort-only
+0.0818, test-cohorts-only ~0. Since tenure rises mechanically as the
+same largely-overlapping customers age across the pooled reference
+window, most of that number is an artifact of how wide a window gets
+pooled into "reference," not evidence of a population shift — the
+original characterization overstated it.
+
+**Decision:** Added `models.split.trainval_split()` (train+val
+combined, factored so `time_based_split` and it share one boundary
+implementation via `_split_boundaries`) and switched every drift
+reference-window use to it. Re-verified live afterward (see PLAN.md)
+and softened the `tenure_months` finding's write-up to describe it
+honestly — real but modest given the fix, and substantially explained
+by mechanical aging across a pooled multi-month reference window, not
+asserted as a clean population-drift signal.
+
+### performance-report-must-recompute-risk-band-from-current-config-not-trust-the-stored-column
+
+**Situation:** `cohort_performance_report`'s precision/recall "flagged"
+definition used each row's *stored* `risk_band` column — whatever
+`config.yaml`'s `risk_bands` were at scoring time, not necessarily now.
+The reviewer confirmed this has zero effect on today's data (0 of
+87,517 rows disagree with current thresholds) but is a latent
+inconsistency: if `risk_bands` changes without a full backfill rerun,
+the report would silently mix threshold vintages.
+
+**Decision:** Recompute "flagged" from each row's stored `probability`
+via `churn.models.inference.risk_band(probability, cfg)` against
+*current* config, every time — never the stored column. Also added an
+`in_sample: bool` field to `CohortPerformance` (`True` for
+train/validation, which the champion was actually fit on; `False` for
+test/post-test) and corrected the dashboard/report captions, which
+previously called train+validation cohorts "(partially) in-sample" —
+inaccurate, since every row in those cohorts genuinely was training
+data. Test cohorts aren't perfectly clean either (the promotion gate
+compares candidates by test PR-AUC), documented as such rather than
+implied to be fully clean.
+
+### current-cohort-queries-must-filter-by-champion-model-version-in-sql
+
+**Situation:** `dashboards/app.py`/`dashboards/report.py` both loaded
+the "current cohort" by filtering `predictions` on `reference_date ==
+snapshot_date` alone. `predictions`' unique key is `(customer_id,
+reference_date, model_version)` specifically because more than one
+model version can score the same cohort — after the *next* promotion
+and `batch_score.py` run, that reference_date would hold rows from two
+versions, silently doubling "customers scored" and duplicating every
+row in the "top 20 highest-risk" table. Latent today (only one version
+has ever scored the current cohort) — confirmed by reading the schema
+and code, not by triggering it live.
+
+**Decision:** Created `src/churn/monitoring/loaders.py` — one shared
+`load_panel`/`champion_version`/`load_current_cohort_predictions`/
+`load_matured_predictions` implementation, all filtering by
+`model_version` in SQL (not `SELECT * FROM predictions` plus a
+client-side filter, which also re-reads every historical version's full
+backfill on every render as `predictions` grows). `pipelines/monitor.py`,
+`dashboards/app.py`, and `dashboards/report.py` all now import from
+here instead of each keeping its own copy — the reviewer's broader
+point was that three independent copies of this loading logic meant a
+fix here would otherwise have needed applying three times, with real
+risk of missing one.
+
+### prefect-tasks-must-run-from-project-root-and-relay-child-output
+
+**Situation:** Two related gaps in `pipelines/flows.py`, both found by
+an independent review: (1) `subprocess.run` didn't set `cwd`, so a
+Prefect worker started from any directory other than the project root
+would fail every task (`.env` resolution and relative script paths like
+`"pipelines/train.py"` are cwd-relative) — it would fail loudly, not
+silently, but still fail somewhere this project's own docs never warned
+about; (2) child stdout/stderr were never captured, so despite this
+file's own docstring claiming "structured run history," the actual JSON
+log lines each script produces (the thing an operator would want to see
+in the Prefect UI) went nowhere Prefect could show them — only a
+one-line "running: ..." announcement and, on failure, the bare exit
+code.
+
+**Decision:** `run_script` now passes `cwd=PROJECT_ROOT` explicitly, and
+captures + relays full stdout (info level) and stderr (warning level)
+into Prefect's own run logger via `capture_output=True`. Also set
+`encoding="utf-8"` explicitly on the capture: piping a child's output
+(rather than letting it print straight to a console) makes Python
+decode the captured bytes using this process's own default encoding
+unless told otherwise — cp1252 on Windows — which would raise a decode-
+time `UnicodeDecodeError` on MLflow's emoji print, a different failure
+mode than the console-print-time `UnicodeEncodeError` CLAUDE.md's
+existing gotcha describes.
+
+### train-task-must-not-auto-retry
+
+**Situation:** `pipelines/flows.py`'s default `retries=1` applies to
+every task, including `pipelines/train.py` — but training registers a
+new model version and may promote it *before* a later step in the same
+script can fail (e.g. logging the model card). A retry after that point
+wouldn't safely redo idempotent work; it would register a second,
+redundant version on top of a run that already partially succeeded.
+Verified the flow's failure-halting behavior itself is real and not
+just assumed: the reviewer built a standalone flow using the identical
+`run_script` pattern, made one task fail on purpose, and confirmed the
+flow halts in a `Failed` state without running the next task.
+
+**Decision:** The training step now runs via
+`run_script.with_options(retries=0)(...)`, leaving every other task
+(ingest, build panel, batch score, backfill, monitor — all safely
+re-runnable/idempotent per their own docstrings) on the default
+`retries=1`.
+
+### backfill-label-matured-at-must-be-the-labels-actual-maturity-date
+
+**Situation:** `backfill_predictions.py` set every backfilled row's
+`label_matured_at` to `now()` at backfill time — meaning re-running the
+backfill rewrote all ~82k rows' `label_matured_at` to a new "now" every
+time, and the live data showed exactly that: one distinct 2026
+timestamp on labels for 2023-2024 cohorts, which is nonsensical for a
+column meant to record when a label matured.
+
+**Decision:** `label_matured_at` is now computed per row as
+`reference_date + prediction_horizon_days` — an objective fact about
+when that specific label actually matured, independent of when the
+backfill script happens to run. Re-running the backfill is now a true
+no-op on this column (only `scored_at` still legitimately updates on
+rerun, same as `batch_score.py`).
+
+### dashboard-and-report-probability-display-gets-a-calibration-caveat-not-a-retrain
+
+**Situation:** The reviewer measured, on live matured rows: mean stored
+probability 0.31 vs. an actual churn rate of 1.6%, 42% of customers
+banded medium-or-higher, precision at that threshold 3-4%. The
+dashboard's "Mean probability 0.322" metric reads as a real probability
+to anyone who hasn't already seen Phase 4's finding that
+`class_weight="balanced"` training deliberately trades calibration for
+separating the classes, and that the *configured* `risk_bands` need
+recalibrating before real use (DECISIONS.md's Phase 4 section,
+PLAN.md's Phase 4 verify section — this is a known, already-documented
+limitation, not a new discovery).
+
+**Decision:** Added a visible caption next to the probability display
+in both `dashboards/app.py` and `dashboards/report.py` pointing at this
+exact limitation, rather than recalibrating the model or re-deriving
+the risk bands by percentile. Recalibrating would mean re-opening Phase
+4/5's already-reasoned-through modeling conclusions on the strength of
+a Phase 7 dashboard-presentation finding — a legitimate future
+improvement, but out of this phase's scope; making the existing,
+already-documented caveat impossible to miss on the one screen someone
+is most likely to read first is the right-sized fix here.
+
+### deferred-without-a-code-change
+
+- **A rigorous statistical treatment of the KS p-value.** This panel's
+  cohorts share mostly the same customers a few months apart, violating
+  the two-sample KS test's independence assumption — the reviewer found
+  p-values as small as 1.8e-144 on a feature (`monetary_charges_90d`)
+  whose PSI reads "stable". Rather than removing the p-value (still a
+  useful rough signal) or building a proper paired/repeated-measures
+  test (real statistical work, out of scope here), added a caption
+  in both dashboard surfaces explaining the caveat plainly.
+- **Persisting monitoring run history for trend charts without
+  recomputing.** Raised again in this review (the reviewer's "unbounded
+  growth" point is really about `SELECT *` becoming expensive as
+  `predictions` grows, which `loaders.py`'s SQL-side filtering already
+  addresses) — the original Phase 7 scoping decision
+  (DECISIONS.md#monitoring-results-are-computed-on-demand-not-persisted)
+  still holds: revisit if live recomputation ever actually becomes slow.

@@ -62,6 +62,7 @@ def cfg() -> AppConfig:
                 "psi_warning_threshold": 0.1,
                 "psi_critical_threshold": 0.25,
                 "drift_bins": 10,
+                "null_rate_delta_threshold": 0.1,
             },
         }
     )
@@ -130,6 +131,73 @@ def test_psi_handles_empty_series_without_raising() -> None:
     reference = pd.Series([], dtype=float)
     current = pd.Series([1.0, 2.0])
     assert np.isnan(population_stability_index(reference, current))
+
+
+def test_psi_detects_a_shift_within_a_low_cardinality_dominant_bucket() -> None:
+    """Regression test for a real blocker an independent review found:
+    quantile-binning alone collapsed a skewed, low-cardinality count
+    feature (~91% of rows at one value, matching this project's
+    frequency_charges_90d) into ~2 buckets, with nearly all mass of both
+    distributions landing in the same catch-all bucket -- so PSI read
+    ~0.0 no matter how much `current` actually shifted within it. Exact
+    per-value binning (triggered whenever `reference` has <= `bins`
+    distinct values) must catch this."""
+    rng = np.random.default_rng(0)
+    reference = pd.Series(np.concatenate([np.zeros(910), rng.integers(1, 6, size=90)]).astype(int))
+    # current has moved a third of the dominant-bucket mass elsewhere --
+    # a real shift a 2-bucket quantile split would hide entirely.
+    current = pd.Series(
+        np.concatenate([np.zeros(600), np.full(300, 3), rng.integers(1, 6, size=100)]).astype(int)
+    )
+    assert len(reference.unique()) <= 10  # confirms this hits the low-cardinality path
+    assert population_stability_index(reference, current) > 0.1
+
+
+def test_psi_is_zero_for_an_unshifted_constant_reference() -> None:
+    reference = pd.Series([3] * 1000)
+    current = pd.Series([3] * 1000)
+    assert population_stability_index(reference, current) < 0.01
+
+
+def test_psi_detects_a_shift_away_from_a_constant_reference() -> None:
+    reference = pd.Series([3] * 1000)
+    current = pd.Series([3] * 500 + [7] * 500)
+    assert population_stability_index(reference, current) > 0.25
+
+
+def test_drift_report_flags_a_null_rate_jump_as_significant_even_when_psi_is_stable(
+    cfg: AppConfig,
+) -> None:
+    """Regression test: every PSI/KS/KL computation drops nulls before
+    comparing, so a feature that started going missing far more often
+    looked "stable" purely because the *surviving* non-null values
+    hadn't moved -- an independent review found a feature going from 0%
+    to 100% null came back merely "unknown" (PSI undefined), the least
+    visible outcome for the most serious data failure a feature can
+    have."""
+    rng = np.random.default_rng(0)
+    non_null = _numeric_series(rng, mean=0.0, n=1000)
+    reference = pd.DataFrame({"feature": non_null})
+    current_values = non_null.copy()
+    current_values.iloc[:600] = np.nan  # 60% newly null; the rest unchanged
+    current = pd.DataFrame({"feature": current_values})
+
+    report = drift_report(reference, current, ["feature"], cfg)
+
+    assert report[0].severity == "significant"
+    assert report[0].reference_null_rate == pytest.approx(0.0)
+    assert report[0].current_null_rate == pytest.approx(0.6)
+
+
+def test_drift_report_null_rates_are_stable_when_unchanged(cfg: AppConfig) -> None:
+    rng = np.random.default_rng(0)
+    reference = pd.DataFrame({"feature": _numeric_series(rng, mean=0.0)})
+    current = pd.DataFrame({"feature": _numeric_series(rng, mean=0.0)})
+
+    report = drift_report(reference, current, ["feature"], cfg)
+
+    assert report[0].reference_null_rate == 0.0
+    assert report[0].current_null_rate == 0.0
 
 
 def test_drift_report_sorts_by_psi_descending_and_classifies_severity(cfg: AppConfig) -> None:

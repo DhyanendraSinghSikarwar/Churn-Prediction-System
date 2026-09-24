@@ -185,11 +185,13 @@ what each target runs.
 - `predictions` rows come in two shapes: just-scored (`batch_score.py`/
   `api/main.py`, `actual_churned`/`label_matured_at` both NULL — label
   hasn't matured) and backfilled (`backfill_predictions.py`, both
-  populated — a historical, already-known outcome). Filter on
-  `actual_churned IS NOT NULL` before computing any performance metric
-  (`src/churn/monitoring/performance.py` already does); scoring the
-  unmatured rows as if they had a label is a silent correctness bug, not
-  a crash.
+  populated — a historical, already-known outcome). The *caller* must
+  filter on `actual_churned IS NOT NULL` before passing rows to
+  `cohort_performance_report()` — it's a precondition documented in that
+  function's docstring, not something it enforces itself; every current
+  caller does this via `churn.monitoring.loaders.load_matured_predictions`.
+  Scoring the unmatured rows as if they had a label is a silent
+  correctness bug, not a crash.
 - `src/churn/monitoring/performance.py`'s per-cohort numbers are **not**
   directly comparable to Phase 5's pooled test-window PR-AUC (0.1093) —
   one number per calendar month vs. one number over the whole pooled

@@ -7,6 +7,12 @@ for someone without a running Streamlit server. Tables only (pandas
 `.to_html()`/`.style` + inline CSS) -- no new charting dependency for
 what's otherwise a demo/portfolio deliverable already well served by
 tables and the interactive dashboard's charts.
+
+Loads through `churn.monitoring.loaders`, the same shared module
+`dashboards/app.py` uses -- not an independent copy of the panel/
+predictions-loading logic. See `dashboards/app.py`'s module docstring
+for why that matters (a review found a real bug hiding in two
+independently-duplicated copies of this loading logic at once).
 """
 
 from __future__ import annotations
@@ -17,15 +23,18 @@ from pathlib import Path
 
 import mlflow
 import pandas as pd
-from mlflow.tracking import MlflowClient
-from sqlalchemy import text
 
 from churn.config import PROJECT_ROOT, AppConfig, get_app_config
-from churn.db.engine import get_engine
-from churn.models.inference import current_champion_version, scoring_cohort
+from churn.models.inference import scoring_cohort
 from churn.models.pipeline import load_selected_features
-from churn.models.split import modeling_panel, time_based_split
+from churn.models.split import modeling_panel, trainval_split
 from churn.monitoring.drift import SEVERITY_COLORS, drift_report
+from churn.monitoring.loaders import (
+    champion_version,
+    load_current_cohort_predictions,
+    load_matured_predictions,
+    load_panel,
+)
 from churn.monitoring.performance import cohort_performance_report
 from churn.utils.logging import configure_logging, get_logger
 
@@ -53,16 +62,10 @@ def _highlight_drift_severity(row: pd.Series) -> list[str]:
     return [f"background-color: {color}" if color else ""] * len(row)
 
 
-def _champion_version(cfg: AppConfig) -> str | None:
-    try:
-        return current_champion_version(cfg.mlflow.registry_model_name, MlflowClient())
-    except Exception:
-        logger.warning("report_champion_unavailable", exc_info=True)
-        return None
-
-
-def _overview_section(predictions: pd.DataFrame, cfg: AppConfig) -> str:
-    current = predictions[predictions["reference_date"] == pd.Timestamp(cfg.data.snapshot_date)]
+def _overview_section(cfg: AppConfig, version: str | None) -> str:
+    if version is None:
+        return "<h2>Current cohort</h2><p>No champion available.</p>"
+    current = load_current_cohort_predictions(cfg, version)
     if current.empty:
         return "<h2>Current cohort</h2><p>No predictions for the current cohort yet.</p>"
 
@@ -89,6 +92,10 @@ def _overview_section(predictions: pd.DataFrame, cfg: AppConfig) -> str:
     return f"""
     <h2>Current cohort ({cfg.data.snapshot_date})</h2>
     <div class="metrics">{metrics}</div>
+    <p class="caption">⚠️ These are the model's raw scores, not calibrated
+    churn probabilities -- class_weight="balanced" training biases them well above
+    the true ~1.6% base churn rate (see DECISIONS.md's Phase 4 section on
+    risk_bands needing recalibration before real use).</p>
     <h3>Top 20 highest-risk customers</h3>
     {top_table}
     """
@@ -99,28 +106,30 @@ def _drift_section(panel: pd.DataFrame, cfg: AppConfig) -> str:
     if current_cohort.empty:
         return "<h2>Feature drift</h2><p>No current cohort to compare against yet.</p>"
 
-    train_df, _, _ = time_based_split(modeling_panel(panel, cfg), cfg)
+    reference = trainval_split(modeling_panel(panel, cfg), cfg)
     selected_features = load_selected_features(cfg)
-    results = drift_report(train_df, current_cohort, selected_features, cfg)
+    results = drift_report(reference, current_cohort, selected_features, cfg)
     df = pd.DataFrame([r.__dict__ for r in results])
-    table = df.style.apply(_highlight_drift_severity, axis=1).to_html(index=False)
+    table = df.style.apply(_highlight_drift_severity, axis=1).hide(axis="index").to_html()
     return f"""
-    <h2>Feature drift: training window vs. current cohort</h2>
+    <h2>Feature drift: training window (train+val) vs. current cohort</h2>
     <p class="caption">PSI &gt;= {cfg.monitoring.psi_critical_threshold} flagged significant,
-    &gt;= {cfg.monitoring.psi_warning_threshold} flagged moderate.</p>
+    &gt;= {cfg.monitoring.psi_warning_threshold} flagged moderate. A feature's null rate
+    changing by &gt;= {cfg.monitoring.null_rate_delta_threshold:.0%} is flagged significant
+    on its own, regardless of PSI.</p>
+    <p class="caption">KS p-values assume independent samples; this panel's cohorts share
+    mostly the same customers a few months apart, so a very small p-value here can reflect
+    that repetition rather than a real shift -- treat it as a rough signal, not a rigorous
+    test.</p>
     {table}
     """
 
 
-def _performance_section(
-    predictions: pd.DataFrame, champion_version: str | None, cfg: AppConfig
-) -> str:
-    if champion_version is None:
+def _performance_section(cfg: AppConfig, version: str | None) -> str:
+    if version is None:
         return "<h2>Performance over time</h2><p>No champion available.</p>"
 
-    matured = predictions[
-        (predictions["model_version"] == champion_version) & predictions["actual_churned"].notna()
-    ]
+    matured = load_matured_predictions(cfg, version)
     if matured.empty:
         return (
             "<h2>Performance over time</h2>"
@@ -132,40 +141,32 @@ def _performance_section(
     df = pd.DataFrame([r.__dict__ for r in report])
     table = df.to_html(index=False)
     return f"""
-    <h2>Performance over time (champion v{champion_version})</h2>
-    <p class="caption">train/validation cohorts are (partially) in-sample -- only test/post-test
-    cohorts are genuine held-out performance.</p>
+    <h2>Performance over time (champion v{version})</h2>
+    <p class="caption">in_sample=True (train/validation) cohorts were part of what the
+    champion was actually fit on -- their numbers are optimistic by construction, not just
+    "partially" so. in_sample=False (test/post-test) cohorts are held-out, though test also
+    mildly influenced which model got promoted (see performance.py's module docstring).</p>
     {table}
     """
 
 
 def build_report(cfg: AppConfig) -> str:
     mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
-    engine = get_engine()
 
-    panel = pd.read_sql(
-        text("SELECT * FROM feature_snapshots WHERE feature_set_version = :v"),
-        engine,
-        params={"v": cfg.feature_set.version},
-    )
-    panel["reference_date"] = pd.to_datetime(panel["reference_date"])
-
-    predictions = pd.read_sql(text("SELECT * FROM predictions"), engine)
-    predictions["reference_date"] = pd.to_datetime(predictions["reference_date"])
-
-    champion_version = _champion_version(cfg)
+    panel = load_panel(cfg)
+    version = champion_version(cfg)
 
     body = (
-        _overview_section(predictions, cfg)
+        _overview_section(cfg, version)
         + _drift_section(panel, cfg)
-        + _performance_section(predictions, champion_version, cfg)
+        + _performance_section(cfg, version)
     )
     generated_at = pd.Timestamp.now("UTC").isoformat()
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Churn Prediction Monitoring Report</title>{_STYLE}</head>
 <body>
 <h1>Churn Prediction Monitoring Report</h1>
-<p class="caption">Generated {generated_at} UTC</p>
+<p class="caption">Generated {generated_at}</p>
 {body}
 </body></html>"""
 

@@ -129,6 +129,11 @@ class MonitoringConfig(BaseModel):
     psi_warning_threshold: float = Field(gt=0)
     psi_critical_threshold: float = Field(gt=0)
     drift_bins: int = Field(gt=1)
+    # A feature's null rate changing by at least this much (a fraction,
+    # e.g. 0.1 = 10 percentage points) is flagged "significant" on its
+    # own, regardless of PSI on the non-null values -- see
+    # monitoring/drift.py's module docstring.
+    null_rate_delta_threshold: float = Field(gt=0, le=1)
 
     @field_validator("psi_critical_threshold")
     @classmethod

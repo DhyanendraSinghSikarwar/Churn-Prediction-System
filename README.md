@@ -130,13 +130,14 @@ real notebook/pipeline execution, not just written:
   current champion, giving `src/churn/monitoring/performance.py`
   something real to report — a genuine, honestly-labeled
   train/validation/test performance trend, not a single number
-  (test-cohort PR-AUC 0.11–0.12, correctly lower than the partially
+  (held-out test-cohort PR-AUC 0.11–0.12, correctly lower than the
   in-sample training cohorts' 0.09–0.20). `src/churn/monitoring/drift.py`
   (PSI/KS/KL) found a real, moderate drift signal on `tenure_months`
-  (PSI 0.2179) between the training window and the live cohort — every
-  other feature stayed stable. `pipelines/flows.py` orchestrates the
-  whole pipeline (ingest → build panel → train → batch score → backfill
-  → monitor) as one Prefect flow, run end to end for real:
+  (PSI 0.1881, comparing against train+val — the window the champion was
+  actually fit on) between the training window and the live cohort —
+  every other feature stayed stable. `pipelines/flows.py` orchestrates
+  the whole pipeline (ingest → build panel → train → batch score →
+  backfill → monitor) as one Prefect flow, run end to end for real:
   ingestion/panel-building correctly no-op'd (already up to date), a new
   training run correctly tied the champion and was **not** promoted, and
   every downstream stage correctly kept using the untouched champion.
@@ -144,9 +145,13 @@ real notebook/pipeline execution, not just written:
   HTML) render the same monitoring computations interactively/for
   sharing — the Streamlit app verified headlessly with
   `streamlit.testing.v1.AppTest` (zero exceptions), not just a `curl`
-  against the running process. See
-  [PLAN.md](PLAN.md#phase-7--monitoring--dashboard--done) for the full
-  verification.
+  against the running process. Independently reviewed post-hoc before
+  Phase 8: found and fixed a real drift-detection blind spot (quantile
+  binning silently zeroed out PSI on a low-cardinality selected feature;
+  `frequency_charges_90d`'s PSI went from 0.0014 to a real 0.051 once
+  fixed) plus several further real issues, all verified live — see
+  [PLAN.md](PLAN.md#phase-7--monitoring--dashboard--done) and
+  [DECISIONS.md](DECISIONS.md#drift-binning-must-fall-back-to-exact-values-for-low-cardinality-features).
 
 `ruff`, `black --check`, `mypy --strict` clean on `src`, `pipelines`,
 `api`, and `dashboards`. See [PLAN.md](PLAN.md) for the full phase

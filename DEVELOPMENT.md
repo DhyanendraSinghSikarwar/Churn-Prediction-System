@@ -278,19 +278,28 @@ uv run python pipelines/flows.py
 ```
 
 ```bash
-uv run pytest                                                                                  # 81/81 incl. Phase 7 unit tests
+uv run pytest                                                                                  # 92/92 incl. Phase 7 unit + integration tests
 uv run ruff check src tests pipelines api dashboards && uv run black --check src tests pipelines api dashboards && uv run mypy src pipelines api dashboards   # lint clean
 ```
 
 Verify: backfilled 82,343 rows across 17 cohorts; `tenure_months` came
-back with real, moderate drift (PSI 0.2179) between the training window
-and the current cohort, every other feature stable; per-cohort
+back with real, moderate drift (PSI 0.1881, reference window = train+val,
+the window the champion was actually fit on) between the training
+window and the current cohort, every other feature stable; per-cohort
 performance honestly showed lower PR-AUC on the genuine held-out test
-cohorts (0.11–0.12) than on the partially in-sample training cohorts
-(0.09–0.20); the full Prefect flow ran end to end for real, each stage's
-output correctly feeding the next (a tied, non-promoted retrain
-correctly left every downstream stage using the untouched champion).
-Full verification: [PLAN.md#phase-7](PLAN.md).
+cohorts (`in_sample=False`, 0.11–0.12) than on the in-sample training
+cohorts (`in_sample=True`, 0.09–0.20); the full Prefect flow ran end to
+end for real, each stage's output correctly feeding the next (a tied,
+non-promoted retrain correctly left every downstream stage using the
+untouched champion). Full verification: [PLAN.md#phase-7](PLAN.md).
+
+> **Post-review correction**: an independent review before Phase 8
+> found the original drift binning silently zeroed out PSI on
+> low-cardinality features (`frequency_charges_90d` read PSI ~0 when it
+> should have read ~0.05) and that the reference window was train-only
+> instead of train+val — both fixed; the numbers above are post-fix. See
+> [DECISIONS.md#drift-binning-must-fall-back-to-exact-values-for-low-cardinality-features](DECISIONS.md#drift-binning-must-fall-back-to-exact-values-for-low-cardinality-features)
+> for the full list of what else that review found and fixed.
 
 > **Testing `dashboards/app.py` headlessly**: `curl`ing the running
 > Streamlit server only proves the process is up — Streamlit executes

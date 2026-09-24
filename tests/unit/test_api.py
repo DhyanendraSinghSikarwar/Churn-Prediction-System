@@ -67,6 +67,7 @@ def cfg() -> AppConfig:
                 "psi_warning_threshold": 0.1,
                 "psi_critical_threshold": 0.25,
                 "drift_bins": 10,
+                "null_rate_delta_threshold": 0.1,
             },
         }
     )
