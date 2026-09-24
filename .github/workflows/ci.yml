@@ -1,0 +1,41 @@
+# Lint + full test suite (unit and testcontainers integration -- GitHub's
+# ubuntu-latest runners ship Docker already, so tests/integration/ needs
+# no extra services: block or secrets, the same way it needs none
+# locally beyond a running Docker daemon).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Lint (ruff)
+        run: uv run ruff check src tests pipelines api dashboards
+
+      - name: Format check (black)
+        run: uv run black --check src tests pipelines api dashboards
+
+      - name: Type check (mypy --strict)
+        run: uv run mypy src pipelines api dashboards
+
+      - name: Test (unit + testcontainers integration)
+        run: uv run pytest

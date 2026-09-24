@@ -31,6 +31,21 @@ def _already_loaded(conn: Connection, sha256: str) -> bool:
     return result is not None
 
 
+def _validate_row_count(raw: pd.DataFrame, expected: int) -> None:
+    """Refuses to load a source file whose row count doesn't match what
+    was expected at plan time -- the cheapest possible check that the
+    upstream CSV hasn't silently changed shape since this project's
+    assumptions (column layout, `synthesize_all`'s derivations) were
+    written against it. Split out from `run()` so this check is
+    unit-testable without mocking the download/DB/synthesize chain
+    around it."""
+    if len(raw) != expected:
+        raise ValueError(
+            f"Row count mismatch: expected {expected}, "
+            f"got {len(raw)}. Refusing to load — the source file may have changed."
+        )
+
+
 def run(force: bool = False) -> None:
     cfg = get_app_config()
     engine = get_engine()
@@ -44,11 +59,7 @@ def run(force: bool = False) -> None:
                 return
 
     raw = pd.read_csv(path)
-    if len(raw) != cfg.data.source.expected_row_count:
-        raise ValueError(
-            f"Row count mismatch: expected {cfg.data.source.expected_row_count}, "
-            f"got {len(raw)}. Refusing to load — the source file may have changed."
-        )
+    _validate_row_count(raw, cfg.data.source.expected_row_count)
 
     tables = synthesize_all(raw, cfg, seed=cfg.synthetic.random_seed)
 

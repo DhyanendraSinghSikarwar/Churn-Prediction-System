@@ -610,7 +610,79 @@ next starts.
     distinguish a correct branch selection from a lucky one, only a
     second upsert on the same key can).
 
-### Phase 8 — Tests, CI, docs — Not started
+### Phase 8 — Tests, CI, docs — **DONE**
 
-- Coverage target (>80% on `src/`), pre-commit, GitHub Actions, README
-  finalization, runbook.
+- **Coverage**: added unit tests for the highest-value untested logic
+  found by reading the coverage gap, not padding for a number —
+  `ingestion/download.py`'s cache-hit/primary/fallback/both-fail
+  branches (0%→100%), `ingestion/cli.py`'s row-count validation
+  (extracted into its own testable `_validate_row_count` — was inline
+  in `run()`, untestable without mocking the whole download/DB chain
+  around it) and idempotency check, `features/build_panel.py`'s
+  `_monthly_reference_dates`/`_already_built`/`_delete_existing`, and
+  `monitoring/loaders.py`'s SQL parameter construction (a direct
+  regression test for the exact `model_version`-filter bug Phase 7's
+  review found).
+- **pre-commit**: `.pre-commit-config.yaml` — local hooks shelling out
+  to `uv run ruff/black/mypy`, not pinned hook-repo versions, so
+  pre-commit always uses the exact same tool versions
+  `pyproject.toml`'s dev group and CLAUDE.md's documented commands do.
+  Scoped to exactly `src|tests|pipelines|api|dashboards` — **not**
+  `alembic/versions/` or `notebooks/` — see the Verify section below for
+  why that scoping is load-bearing, not cosmetic.
+- **GitHub Actions**: `.github/workflows/ci.yml` — checkout, `uv sync`,
+  ruff/black/mypy, then the full test suite (`ubuntu-latest` ships
+  Docker already, so `tests/integration/`'s testcontainers need no
+  extra `services:` block or secrets — self-contained, same as running
+  it locally).
+- **README finalization**: added the four sections the README
+  explicitly deferred to this phase — an architecture diagram (Mermaid,
+  every arrow a live-verified data flow per PLAN.md's own per-phase
+  Verify sections, not aspirational), a curated design-decisions
+  summary (the ~8 calls that shaped the system most, linking to
+  DECISIONS.md's full entries rather than duplicating ~1,500 lines), a
+  known-limitations section (collecting every already-documented
+  caveat — uncalibrated probabilities, risk bands needing
+  recalibration, the A/B test's ~137-month accumulation time,
+  GroupKFold-vs-forward-PR-AUC, KS p-value independence, the residual
+  drift-binning gap, no persisted monitoring history, no auth on the
+  API, no git remote — in one place instead of scattered), and a
+  runbook (restart/health-check steps, retrain-and-promote, roll back a
+  bad promotion, re-run one failed pipeline stage, check test/lint
+  status, where the logs are).
+- **Verify — run for real, not just written:**
+  - Full suite: **110/110 passing**, coverage **88%** on `src/` (up
+    from 78% before this phase's test additions) — clears the >80%
+    target with room to spare. Remaining gaps are almost entirely
+    `run()`/`main()` orchestration bodies in `ingestion/cli.py` and
+    `features/build_panel.py` — already exercised end-to-end by real,
+    live-verified runs throughout Phases 1-7 (see each phase's own
+    Verify section) and by `tests/integration/`'s testcontainers tests
+    of the SQL/logic they call; not further unit-mocked, since heavily
+    mocking an entire download→validate→synthesize→load chain for a
+    few more coverage percentage points would cost more in test
+    complexity than it protects, on a codebase whose actual bugs this
+    project's three independent reviews found in *logic*, never in
+    orchestration glue.
+  - `ruff check`, `black --check`, `mypy --strict` clean on `src`,
+    `tests`, `pipelines`, `api`, `dashboards`.
+  - **pre-commit, run for real, found a real scoping bug in itself**:
+    `uv run pre-commit run --all-files` on the first, unscoped version
+    of `.pre-commit-config.yaml` (bare `types: [python]`, no `files:`
+    restriction) let black silently reformat two committed,
+    already-applied Alembic migration files
+    (`alembic/versions/48ccb1be188e_initial_schema.py` and
+    `18765fcc5439_add_feature_snapshots_typed_columns.py`) — exactly
+    the kind of "never hand-edit a generated file" mistake this
+    project avoids everywhere else. Caught immediately via `git
+    status`/`git diff` before committing, reverted
+    (`git checkout --`), and fixed by scoping every hook's `files:` to
+    match CLAUDE.md's documented lint command paths exactly. Re-ran
+    `pre-commit run --all-files` after the fix: all three hooks pass,
+    `git status` confirms `alembic/` untouched.
+  - GitHub Actions **could not be live-verified**: no git remote is
+    configured (a local-only repo throughout this project, per
+    CLAUDE.md's own Gotchas) — `.github/workflows/ci.yml` is written to
+    run the exact same commands already verified locally, but has never
+    actually executed on GitHub's runners. Flagged in the README's
+    Known Limitations rather than claimed as verified.
