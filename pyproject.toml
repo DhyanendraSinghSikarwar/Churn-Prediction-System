@@ -23,6 +23,10 @@ dependencies = [
     "pandera>=0.33.1",
     "scikit-learn>=1.4.2",
     "mlflow>=3.16.1",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.53.0",
+    "prometheus-client>=0.26.0",
+    "shap>=0.51.0",
 ]
 
 [dependency-groups]
@@ -38,12 +42,15 @@ dev = [
     "pandas-stubs>=2.2.1",
     "testcontainers[postgres]>=4.4.0",
     "types-python-dateutil>=2.9.0.20260807",
+    "httpx>=0.28.1",
 ]
 # Exploration-only: nothing under src/churn imports these. Kept apart
 # from `dependencies` per DECISIONS.md ("add dependencies per-phase
 # rather than front-loading the whole stack"). scikit-learn and mlflow
 # moved to `dependencies` in Phase 5, once src/churn/models actually
-# started importing them, per this same policy.
+# started importing them; shap moved in Phase 6, once
+# src/churn/models/inference.py started importing it, per this same
+# policy.
 notebooks = [
     "jupyter>=1.0.0",
     "nbconvert>=7.16.3",
@@ -55,7 +62,6 @@ notebooks = [
     "seaborn>=0.13.2",
     "imbalanced-learn>=0.12.2",
     "optuna>=5.0.0",
-    "shap>=0.51.0",
 ]
 
 [build-system]
@@ -92,10 +98,10 @@ module = ["testcontainers.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# sklearn/mlflow ship no py.typed marker (as of the pinned versions here)
-# -- first exercised in Phase 5, which is the first code under src/ to
-# import either.
-module = ["sklearn.*", "mlflow.*"]
+# sklearn/mlflow/shap ship no py.typed marker (as of the pinned versions
+# here) -- sklearn/mlflow first exercised in Phase 5; shap in Phase 6
+# (src/churn/models/inference.py).
+module = ["sklearn.*", "mlflow.*", "shap.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

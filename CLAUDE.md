@@ -6,7 +6,7 @@ Production-style customer churn prediction system (Postgres → idempotent
 ingestion → SQL feature extraction → training → serving API → monitoring)
 built on the IBM Telco Customer Churn dataset. **Synthetic-data demo** —
 everything with a date on it is a seeded, documented synthetic layer, not
-real telecom events; see DECISIONS.md. Currently Phase 5/8 done — see
+real telecom events; see DECISIONS.md. Currently Phase 6/8 done — see
 PLAN.md for phase status, DECISIONS.md for the why behind every
 non-obvious call.
 
@@ -19,10 +19,12 @@ docker compose up -d postgres pgadmin minio minio-init mlflow
 uv run alembic upgrade head                              # db up + migrate
 uv run python -m churn.ingestion.cli                      # ingest
 uv run python pipelines/train.py                          # train + register (Phase 5)
+uv run python pipelines/batch_score.py                    # batch-score the current cohort (Phase 6)
+uv run uvicorn api.main:app --host 0.0.0.0 --port 8000     # serve the inference API (Phase 6)
 uv run pytest                                             # full suite (needs Docker)
 uv run pytest tests/unit                                  # unit only, no Docker
-uv run ruff check src tests && uv run black --check src tests && uv run mypy src   # lint
-uv run ruff check --fix src tests && uv run black src tests                        # format
+uv run ruff check src tests pipelines api && uv run black --check src tests pipelines api && uv run mypy src pipelines api   # lint
+uv run ruff check --fix src tests pipelines api && uv run black src tests pipelines api                                     # format
 ```
 
 Equivalent `make` targets exist (`make setup`, `make db-up`, `make test`, …)
@@ -37,13 +39,19 @@ what each target runs.
   hidden behind an ORM query layer (deliberate, so window-function SQL
   stays reviewable — DECISIONS.md#tech-stack).
 - `notebooks/` — exploration only; nothing under `src/churn` imports from it.
-- `src/churn/models/` — `split.py`/`pipeline.py`/`registry.py`: the single
-  source of truth for the train/val/test split, the preprocessing+model
-  `Pipeline` builder, and MLflow registry helpers. `pipelines/train.py`
-  and any future notebook/pipeline must reuse these, never re-implement
-  them inline — that duplication is exactly what caused Phase 4's
-  shared-`ColumnTransformer` bug (DECISIONS.md).
-- `api/`, `dashboards/` — scaffolded, not yet built (Phase 6–7).
+- `src/churn/models/` — `split.py`/`pipeline.py`/`registry.py`/`inference.py`:
+  the single source of truth for the train/val/test split, the
+  preprocessing+model `Pipeline` builder, MLflow registry helpers, and
+  serving-side helpers (load the champion, risk-band, SHAP top-3,
+  predictions upsert). `pipelines/train.py`, `pipelines/batch_score.py`,
+  `api/main.py`, and any future notebook/pipeline must reuse these, never
+  re-implement them inline — that duplication is exactly what caused
+  Phase 4's shared-`ColumnTransformer` bug (DECISIONS.md).
+- `pipelines/batch_score.py` scores the current cohort in bulk and writes
+  to `predictions`; `api/main.py` serves those rows plus an on-demand
+  single-customer rescore — both built on `src/churn/models/inference.py`,
+  neither duplicates its logic.
+- `dashboards/` — scaffolded, not yet built (Phase 7).
 
 ## Conventions
 
@@ -121,6 +129,17 @@ what each target runs.
   API (`set_registered_model_alias`/`get_model_version_by_alias`), not
   the deprecated stages API — see
   DECISIONS.md#mlflow-client-3x-vs-server-2x-model-logging-incompatibility.
-- `sklearn`/`mlflow` ship no `py.typed` marker — both need a
+- `sklearn`/`mlflow`/`shap` ship no `py.typed` marker — all three need a
   `[[tool.mypy.overrides]] ignore_missing_imports = true` entry (already
   added); a new untyped ML dependency will need the same treatment.
+- `api/main.py` loads the champion model once at startup (FastAPI
+  `lifespan`), not per-request — if MLflow/the registry is unreachable at
+  startup, the API still comes up (`app.state.champion = None`);
+  `/predictions` and `/health` keep working off Postgres alone, and only
+  `POST /score/{customer_id}` 503s until a model loads. Don't "fix" this
+  by making startup fail hard — that's the graceful-degradation behavior
+  Phase 6 was built for.
+- `fastapi`/`uvicorn`/`prometheus-client`/`httpx` were already present as
+  transitive deps (via mlflow's own bundled server) before Phase 6 added
+  them explicitly to `pyproject.toml` — don't assume a package importing
+  cleanly means it's an intentional dependency; check `pyproject.toml`.

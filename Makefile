@@ -25,22 +25,22 @@ train:
 	uv run python pipelines/train.py
 
 score:
-	@echo "Phase 6 not yet built: pipelines/batch_score.py"
+	uv run python pipelines/batch_score.py
 
 serve:
-	@echo "Phase 6 not yet built: api/"
+	uv run uvicorn api.main:app --host 0.0.0.0 --port 8000
 
 test:
 	uv run pytest
 
 lint:
-	uv run ruff check src tests
-	uv run black --check src tests
-	uv run mypy src
+	uv run ruff check src tests pipelines api
+	uv run black --check src tests pipelines api
+	uv run mypy src pipelines api
 
 format:
-	uv run ruff check --fix src tests
-	uv run black src tests
+	uv run ruff check --fix src tests pipelines api
+	uv run black src tests pipelines api
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} +

@@ -32,6 +32,8 @@ uv run python -m churn.features.build_panel
 uv run pytest
 
 uv run python pipelines/train.py   # trains + registers the champion model (Phase 5)
+uv run python pipelines/batch_score.py            # scores the current cohort (Phase 6)
+uv run uvicorn api.main:app --host 0.0.0.0 --port 8000   # serves predictions (Phase 6)
 ```
 
 Equivalent `make` targets exist (`make setup`, `make db-up`, `make ingest`,
@@ -47,10 +49,11 @@ Services once `db-up` has run:
 | pgAdmin | http://localhost:5050 |
 | MinIO console | http://localhost:9001 |
 | MLflow | http://localhost:5000 |
+| Inference API (once `make serve`/uvicorn is running) | http://localhost:8000 |
 
 ## Status
 
-Phases 1–5 complete, all verified end-to-end against real containers and
+Phases 1–6 complete, all verified end-to-end against real containers and
 real notebook/pipeline execution, not just written:
 
 - **Phase 1** (infra + DB + ingestion): 7,043 customers loaded, zero
@@ -97,22 +100,34 @@ real notebook/pipeline execution, not just written:
   `promotion_epsilon`. See
   [PLAN.md](PLAN.md#phase-5--training-pipeline--registry--done) for the
   full verification.
+- **Phase 6** (inference API + batch scoring): `pipelines/batch_score.py`
+  scores the real current cohort (5,174 customers) and idempotently
+  upserts risk band + top-3 SHAP features into `predictions`; `api/`
+  (FastAPI) serves those predictions plus an on-demand single-customer
+  rescore, with Prometheus metrics, request-ID correlation, and graceful
+  degradation (verified live by stopping Postgres mid-request — `/health`
+  correctly returned 503 rather than crashing or hanging, the latter
+  only true after a real connect-timeout bug this same test exposed was
+  fixed). See
+  [PLAN.md](PLAN.md#phase-6--inference-api--batch-scoring--done) for the
+  full verification, including a required registry re-promotion this
+  phase needed and documented rather than glossed over.
 
-`ruff`, `black --check`, `mypy --strict` clean; 39/39 tests passing
-(unit + testcontainers integration). See [PLAN.md](PLAN.md) for the full
-phase breakdown and what's next.
+`ruff`, `black --check`, `mypy --strict` clean on `src`, `pipelines`, and
+`api`. See [PLAN.md](PLAN.md) for the full phase breakdown, current test
+counts, and what's next.
 
 ## Repository layout
 
 ```
 config/       YAML business/pipeline config (no secrets — see .env.example)
 sql/          ddl (generated from Alembic), features (extraction queries), validation (data-quality queries)
-src/churn/    the package: config, db, ingestion, features, models (Phase 5+)
+src/churn/    the package: config, db, ingestion, features, models (split/pipeline/registry/inference)
 alembic/      versioned schema migrations — the source of truth for the DB schema
 tests/        unit/ (no Docker needed) and integration/ (testcontainers, needs Docker)
 notebooks/    exploration only — nothing here is imported by src/
-pipelines/    train.py (Phase 5); batch_score.py (from Phase 6)
-api/          FastAPI serving layer (from Phase 6)
+pipelines/    train.py (Phase 5); batch_score.py (Phase 6)
+api/          FastAPI serving layer: predictions, on-demand scoring, health, metrics (Phase 6)
 dashboards/   Streamlit app + static report generator (from Phase 7)
 ```
 

@@ -15,8 +15,9 @@ and config/selected_features_v1.yaml) -- gated by:
 
 Every run logs to MLflow: params, metrics (test PR-AUC/ROC-AUC/top-decile
 lift), the single fitted sklearn Pipeline (preprocessing + model, one
-artifact), and a model card summarizing what was trained, on what, and
-why.
+artifact), a background sample of raw training rows for Phase 6's SHAP
+explainer (`churn.models.inference.log_background_sample`), and a model
+card summarizing what was trained, on what, and why.
 """
 
 from __future__ import annotations
@@ -26,15 +27,19 @@ import sys
 import mlflow
 import numpy as np
 import pandas as pd
-import yaml
 from mlflow.tracking import MlflowClient
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sqlalchemy import text
 
-from churn.config import PROJECT_ROOT, AppConfig, get_app_config
+from churn.config import AppConfig, get_app_config
 from churn.db.engine import get_engine
 from churn.features.validation import validate_training_panel
-from churn.models.pipeline import build_pipeline, categorical_and_numeric_features
+from churn.models.inference import log_background_sample
+from churn.models.pipeline import (
+    build_pipeline,
+    categorical_and_numeric_features,
+    load_selected_features,
+)
 from churn.models.registry import (
     current_champion_metric,
     log_pipeline_artifact,
@@ -58,13 +63,6 @@ def _load_panel(cfg: AppConfig) -> pd.DataFrame:
     )
     df["reference_date"] = pd.to_datetime(df["reference_date"])
     return df
-
-
-def _load_selected_features() -> list[str]:
-    path = PROJECT_ROOT / "config" / "selected_features_v1.yaml"
-    with path.open(encoding="utf-8") as fh:
-        artifact = yaml.safe_load(fh)
-    return [str(f) for f in artifact["selected_features"]]
 
 
 def _top_decile_lift(proba: np.ndarray, y_true: np.ndarray) -> float:
@@ -178,7 +176,7 @@ def run() -> None:
     panel = validate_training_panel(panel)
     logger.info("panel_validated", rows=len(panel))
 
-    selected_features = _load_selected_features()
+    selected_features = load_selected_features(cfg)
     cat_features, num_features = categorical_and_numeric_features(panel, selected_features)
 
     train_df, val_df, test_df = time_based_split(panel, cfg)
@@ -228,6 +226,7 @@ def run() -> None:
         mlflow.log_metric("top_decile_lift", top_decile_lift)
 
         log_pipeline_artifact(pipeline, artifact_path=_ARTIFACT_PATH)
+        log_background_sample(features_trainval, random_state=cfg.synthetic.random_seed)
 
         run_id = active_run.info.run_id
 

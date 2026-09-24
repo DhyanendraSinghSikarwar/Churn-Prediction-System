@@ -12,10 +12,24 @@ from the Phase 0 architecture plan.
 from __future__ import annotations
 
 import pandas as pd
+import yaml
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from churn.config import PROJECT_ROOT, AppConfig
+
+
+def load_selected_features(cfg: AppConfig) -> list[str]:
+    """Loads the feature list Notebook 03 selected for this
+    `feature_set_version` -- the single source of truth for both
+    `pipelines/train.py` and `pipelines/batch_score.py`, so the two can
+    never silently train and score on different feature sets."""
+    path = PROJECT_ROOT / "config" / f"selected_features_{cfg.feature_set.version}.yaml"
+    with path.open(encoding="utf-8") as fh:
+        artifact = yaml.safe_load(fh)
+    return [str(f) for f in artifact["selected_features"]]
 
 
 def categorical_and_numeric_features(

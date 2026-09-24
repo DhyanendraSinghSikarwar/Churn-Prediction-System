@@ -906,3 +906,153 @@ what the mocks replace. The two live runs are what this project's
 "verified against real infrastructure, not just written" standard
 (Phase 1 onward) actually requires for something whose entire job is to
 protect a shared registry from a bad promotion.
+
+## Phase 6 — Inference API + Batch Scoring (2026-09-24)
+
+### precomputed-serving-plus-on-demand-rescore-hybrid
+
+**Situation:** "Inference API" could mean either (a) always compute a
+fresh prediction on request, or (b) only ever serve whatever the last
+batch job wrote. This project's SQL feature extraction is deliberately
+panel/window-function-shaped (DECISIONS.md#tech-stack) — it computes a
+full month's cohort in one query, not one customer at a time — so a pure
+"live" API would either duplicate that window-function SQL in a second,
+per-customer form, or pay its full cost on every request.
+
+**Decision:** Two read paths, at deliberately different cost:
+- `GET /predictions/{customer_id}` serves whatever `pipelines/batch_score.py`
+  already wrote to `predictions` — a single indexed read, no model in the
+  loop, the fast/default path.
+- `POST /score/{customer_id}` scores on demand, but only against the
+  current cohort's *already-materialized* `feature_snapshots` row (same
+  table `build_panel.py` fills) — never a live re-run of the
+  window-function extraction query. Both this endpoint and
+  `batch_score.py` call the exact same `churn.models.inference` helpers
+  (`risk_band`, `shap_top_features`, `upsert_predictions`), so there is
+  only one implementation of "how a customer gets scored," matching the
+  project's split/pipeline/registry precedent.
+
+**Rejected alternative:** a fully synchronous endpoint that re-derives
+features inline from raw `customers`/`billing_events`/`support_tickets`
+per request. Rejected because it would duplicate `sql/features/`'s
+window-function logic in a second, per-customer-shaped form — exactly
+the kind of duplication `src/churn/models/` exists to prevent (Phase 4's
+shared-`ColumnTransformer` bug was caused by this same pattern in a
+different guise).
+
+### background-sample-logged-as-a-training-artifact-not-recomputed-at-serving-time
+
+**Situation:** Notebook 05's SHAP `LinearExplainer` needs a small
+"background" sample (the distribution `LinearExplainer` subtracts off) —
+prototyped there as 100 random rows of the train+val set. Serving code
+(`batch_score.py`, `api/main.py`) has no train+val set in scope by
+design — reloading the full historical panel just to draw 100 background
+rows would recouple serving to the entire training history and its cost.
+
+**Decision:** `pipelines/train.py` now logs a 100-row raw-feature
+background sample as a run artifact
+(`explainability/background_sample.csv`, via
+`churn.models.inference.log_background_sample()`) inside the same run as
+the model. `churn.models.inference.load_champion()` downloads both
+together, so serving code only ever touches the current scoring cohort's
+features, never the historical panel.
+
+**Rejected alternative:** computing the background sample at serving
+time from a fresh `feature_snapshots` query. Works, but means every
+batch-scoring run and every API cold start re-queries the full
+historical panel for 100 rows it then throws away — an unnecessary
+coupling and cost this project's "single source of truth, computed
+once" pattern argues against.
+
+### phase-5s-original-champion-manually-repromoted-for-a-required-serving-artifact
+
+**Situation:** The champion registered in Phase 5 (`churn_classifier`
+v1) predates `log_background_sample` above. The first real run of
+`pipelines/batch_score.py` against it failed for real:
+`MlflowException: Failed to download artifacts from path
+'background_sample.csv', please ensure that the path is correct.`
+Because training is fully seeded/deterministic, re-running
+`pipelines/train.py` reproduces the *identical* test PR-AUC
+(0.10932458317915489) every time — v3, the resulting run (now
+carrying the background sample), can never naturally clear
+`promotion_epsilon` against its own tied metric, so the normal
+quality-based gate would never let a background-sample-carrying version
+become champion on its own.
+
+**Decision:** Manually promoted v3 to the `champion` alias
+(`client.set_registered_model_alias("churn_classifier", "champion", "3")`),
+after first confirming programmatically that v3's `test_pr_auc` exactly
+equals v1's (both 0.10932458317915489 — a genuine tie, not a
+close-enough approximation) — see the promotion script's own printed
+confirmation. This is an artifact-schema promotion, not a quality-based
+one, and is recorded here as exactly that: a one-time, deliberate,
+manually-verified exception to the normal gate, made necessary by a
+serving-time requirement (the background sample) that didn't exist when
+v1 was trained. Every future training run logs the background sample by
+construction, so this situation cannot recur.
+
+**Rejected alternative:** adding a fallback into `load_champion()` that
+recomputes a background sample from the historical panel whenever the
+artifact is missing on an older champion version. Rejected because it
+would keep artifact-incomplete old champions permanently "servable,"
+which both reintroduces the cost the artifact was designed to avoid and
+is exactly the kind of backwards-compatibility shim this project avoids
+elsewhere — the champion always being current-and-complete is a
+simpler invariant to maintain than a serving-time fallback path that
+only exists for versions this project no longer intends to promote.
+
+### phase-6-fastapi-uvicorn-prometheus-client-httpx-were-already-transitively-installed
+
+**Situation:** `mlflow` bundles its own FastAPI-based model-serving
+tooling, which pulls in `fastapi`, `uvicorn`, `httpx`, and (for a
+different reason) `prometheus-client` as transitive dependencies —
+confirmed present (`uv pip list`) before Phase 6 ever ran `uv add`.
+
+**Decision:** Added all four explicitly to `pyproject.toml`
+(`fastapi`/`uvicorn[standard]`/`prometheus-client` to `dependencies`,
+`httpx` to the `dev` group for `fastapi.testclient.TestClient`) rather
+than relying on them staying present as someone else's transitive
+dependency. A future mlflow upgrade that drops or changes one of those
+transitive pins would otherwise silently break `api/` with no entry in
+`pyproject.toml` explaining why it used to work.
+
+### shap-promoted-from-the-notebooks-group-to-main-dependencies
+
+**Situation:** `shap` was a `notebooks`-group-only dependency through
+Phase 5 (Notebook 05's explainability section). Phase 6's
+`src/churn/models/inference.py` (used by `pipelines/batch_score.py` and
+`api/main.py`, neither of which is a notebook) now imports it directly.
+
+**Decision:** Moved `shap` from the `notebooks` group to `dependencies`,
+per this project's stated per-phase dependency policy (the same move
+already made for `scikit-learn`/`mlflow` in Phase 5) — see
+`pyproject.toml`'s `notebooks` group comment.
+
+### db-engine-needed-an-explicit-connect-timeout-for-graceful-degradation-to-actually-work
+
+**Situation:** Found by actually breaking the dependency, not by
+inspection: verifying `/health`'s graceful-degradation path by running
+`docker compose stop postgres` against the live API, the *first* request
+right after the stop happened to return fast (a pooled connection that
+hadn't been invalidated yet), but a second request issued moments later
+**hung** — `psycopg`/SQLAlchemy's `create_engine()` had no
+`connect_timeout`, so a new connection attempt against a
+stopping/stopped container's port fell back to the OS's own default TCP
+connect timeout (tens of seconds), not a fast refusal. A DB-down
+`/health` check that takes 30+ seconds to report unhealthy defeats the
+entire point of a liveness probe.
+
+**Decision:** Added `connect_args={"connect_timeout": 5}` to
+`src/churn/db/engine.py`'s single shared `get_engine()` — every caller
+(ingestion, feature building, training, batch scoring, the API) gets the
+same bound. Re-verified live: `docker compose stop postgres`, `/health`
+now returns `503` in ~5.1s (not 200 spuriously, not a multi-second+
+hang); restarting postgres recovers `/health` to `200` within a couple
+of health-check retries.
+
+**Why this belongs in Phase 6, not filed as a separate bug:** the
+hang was only exposed by this phase's own explicit "graceful
+degradation" requirement — nothing before Phase 6 issued DB reads from
+a long-lived server process that needs to fail fast and stay up; every
+earlier phase's DB access was a short-lived CLI script where a slow
+failure was merely annoying, never a liveness-probe correctness bug.

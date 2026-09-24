@@ -1,13 +1,13 @@
 # DEVELOPMENT.md
 
 Step-by-step build log: every command actually run to get this repo from
-an empty clone to its current state (Phases 1–5), in order, so it can be
+an empty clone to its current state (Phases 1–6), in order, so it can be
 reproduced from scratch. This is the "how to run it" doc — see
 [PLAN.md](PLAN.md) for what each phase produced and the verified numbers,
 [DECISIONS.md](DECISIONS.md) for why each non-obvious call was made, and
 [CLAUDE.md](CLAUDE.md) for the condensed command/gotcha reference used
 day to day. This file is maintained phase by phase as the project grows;
-it will cover Phases 6–8 as they're built.
+it will cover Phases 7–8 as they're built.
 
 ## Prerequisites
 
@@ -167,6 +167,67 @@ Verify: first run PR-AUC 0.1093 (bootstraps champion, matches notebook
 05 exactly); second identical run correctly not promoted. Full
 verification: [PLAN.md#phase-5](PLAN.md).
 
+## Phase 6 — Inference API + batch scoring
+
+Requires a champion already registered (Phase 5) that carries the
+`explainability/background_sample.csv` artifact `pipelines/train.py` now
+logs alongside the model. If you're reproducing this project fresh
+(training for the first time under current code), that artifact is
+already there and you can skip straight to batch scoring. If you're
+resuming from a Phase-5-only snapshot whose champion predates this
+artifact, re-run training once first — see the note below.
+
+```bash
+uv run python pipelines/batch_score.py
+```
+
+Scores the current cohort (`feature_snapshots` rows where
+`reference_date == snapshot_date` — the one cohort whose 30-day label
+hasn't matured, i.e. "today" in the synthetic world) against the
+registry's `champion` model, and idempotently upserts one row per
+customer (risk band + top-3 SHAP features) into `predictions`. Safe to
+re-run — a repeat run overwrites existing rows rather than duplicating
+them.
+
+```bash
+uv run uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+Starts the serving API. Try it against the cohort `batch_score.py` just
+scored:
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/predictions/<a customer_id from feature_snapshots>
+curl -X POST http://localhost:8000/score/<same customer_id>
+curl http://localhost:8000/metrics
+```
+
+```bash
+uv run pytest                                                                       # 57/57 incl. Phase 6 unit tests
+uv run ruff check src tests pipelines api && uv run black --check src tests pipelines api && uv run mypy src pipelines api   # lint clean
+```
+
+Verify: real cohort of 5,174 customers scored, risk bands
+low=2,841/medium=1,745/high=588; on-demand `/score` and batch scoring
+agree on the same customer (both call the same
+`src/churn/models/inference.py` functions); `/health` returns 503 (not a
+hang or a crash) when Postgres is stopped, and recovers once it's back.
+Full verification: [PLAN.md#phase-6](PLAN.md).
+
+> **If your champion predates the background-sample artifact** (i.e. you
+> trained under Phase-5-era code before Phase 6 added
+> `log_background_sample`), `batch_score.py` will fail with `Failed to
+> download artifacts from path 'background_sample.csv'`. Fix: re-run
+> `uv run python pipelines/train.py` (deterministic — it will reproduce
+> the same test PR-AUC and *not* auto-promote, since it only ties the
+> existing champion), then manually confirm the tie and move the
+> `champion` alias to the new version — see
+> [DECISIONS.md#phase-5s-original-champion-manually-repromoted-for-a-required-serving-artifact](DECISIONS.md#phase-5s-original-champion-manually-repromoted-for-a-required-serving-artifact)
+> for the exact script and reasoning. This is a one-time situation —
+> every training run from Phase 6 onward logs the artifact by
+> construction.
+
 ---
 
 ## Common gotchas when reproducing this
@@ -191,3 +252,13 @@ full list:
   notebooks, but any new standalone script touching mlflow needs
   `sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")`
   before mlflow prints anything.
+- **A champion trained before Phase 6** has no background-sample
+  artifact — `batch_score.py`/the API's `/score` endpoint will fail
+  downloading it. See the note at the end of the Phase 6 section above.
+- **DB connect timeout matters for the API specifically**: unlike the
+  short-lived CLI scripts (ingest/build_panel/train/batch_score),
+  `api/main.py` is a long-lived server process — `src/churn/db/engine.py`
+  sets `connect_timeout=5` so a DB outage fails `/health` fast instead of
+  hanging on the OS's default TCP timeout. If you change the shared
+  engine, keep this — it's what makes graceful degradation actually
+  graceful.

@@ -318,10 +318,95 @@ next starts.
     marker, first exercised here). Full suite: **39/39 tests passing**
     (unit + testcontainers integration).
 
-### Phase 6 — Inference API + batch scoring — Not started
+### Phase 6 — Inference API + batch scoring — **DONE**
 
-- `pipelines/batch_score.py`, `api/` (FastAPI), Prometheus metrics,
-  request-ID correlation, graceful degradation.
+- `src/churn/models/inference.py` — the single source of truth
+  `pipelines/batch_score.py` and `api/main.py` both build on: loads the
+  registry's `champion` pipeline + a logged background sample
+  (`load_champion`), computes the scoring cohort (the complement of
+  Phase 5's `modeling_panel` — the `reference_date == snapshot_date` rows
+  whose label hasn't matured), risk-bands a probability, extracts top-3
+  SHAP features per row (`LinearExplainer`, matching Notebook 05's
+  prototype exactly), and upserts into `predictions`.
+- `pipelines/batch_score.py` scores the entire current cohort in bulk and
+  writes one row per customer to `predictions`, idempotently (`ON
+  CONFLICT (customer_id, reference_date, model_version) DO UPDATE`).
+- `api/main.py` (FastAPI): two read paths at deliberately different cost
+  — see
+  [DECISIONS.md#precomputed-serving-plus-on-demand-rescore-hybrid](DECISIONS.md#precomputed-serving-plus-on-demand-rescore-hybrid):
+  - `GET /predictions/{customer_id}` — serves the latest precomputed row,
+    DB-only, no model in the loop.
+  - `POST /score/{customer_id}` — on-demand rescore against the
+    customer's already-materialized current-cohort feature row (never a
+    live re-run of the window-function SQL).
+  - `GET /health` — DB + model liveness.
+  - `GET /metrics` — Prometheus (request count/latency by method+path,
+    served-probability histogram).
+  - Request-ID correlation: every request gets an `X-Request-ID`
+    (echoed if the caller sent one, generated otherwise), bound into
+    structlog's contextvars so every log line for that request carries
+    it.
+  - **Graceful degradation**: the champion model loads once at FastAPI
+    startup, not per-request. If MLflow/the registry is unreachable at
+    startup, the API still comes up — `/predictions` and `/health` keep
+    working off Postgres alone, and only `/score` 503s until a model
+    loads.
+- **Verify — run against the real Postgres + MLflow server, including
+  deliberately breaking things, not just the happy path:**
+  - **A required re-promotion, found live:** the champion registered in
+    Phase 5 (`churn_classifier` v1) predates the background-sample
+    artifact SHAP serving needs — the first real `batch_score.py` run
+    against it failed for real (`Failed to download artifacts from path
+    'background_sample.csv'`). Re-ran `pipelines/train.py` (fully
+    seeded/deterministic — reproduced the *identical* test PR-AUC,
+    **0.10932458317915489**, exactly matching v1) to produce v3, which
+    now carries the artifact; confirmed the tie programmatically, then
+    manually promoted v3 to `champion` — an artifact-schema promotion,
+    not a quality-based one, documented in full at
+    [DECISIONS.md#phase-5s-original-champion-manually-repromoted-for-a-required-serving-artifact](DECISIONS.md#phase-5s-original-champion-manually-repromoted-for-a-required-serving-artifact).
+  - **Batch scoring**: scored the real current cohort — **5,174**
+    customers (`reference_date=2024-06-01`) — risk bands **low=2,841 /
+    medium=1,745 / high=588**. Re-ran a second time: identical row count
+    and distribution, confirmed via direct SQL (`count(*)=5174`,
+    `count(DISTINCT customer_id)=5174`) that the upsert overwrote rather
+    than duplicated.
+  - **API, live**: `GET /health` → `200 {"status":"ok","database":"ok","model":"loaded","model_version":"3"}`;
+    `GET /predictions/{known}` → `200` with real SHAP top-3 (e.g. the
+    highest-risk customer, probability 0.97437, top feature
+    `num__frequency_tickets_30d`); `GET /predictions/{unknown}` → `404`;
+    `POST /score/{customer}` → recomputed **0.974369536252729** for the
+    same customer batch-scored at 0.97437 (same model, same features —
+    on-demand and batch scoring agree, as they must, since both call the
+    same `inference.py` functions); request-ID echoed when supplied,
+    generated when absent; `/metrics` scrapeable.
+  - **Graceful degradation, live, not just unit-tested**: `docker compose
+    stop postgres` while the API kept running → `/health` returned `503
+    {"database":"unreachable",...}`; `docker compose start postgres` →
+    `/health` recovered to `200` within a couple of retries. This exposed
+    a real bug along the way — see next bullet.
+  - **A real bug found and fixed via this same live test**: the DB
+    engine had no connect timeout, so a request issued while Postgres
+    was mid-restart *hung* (falling back to the OS's default TCP connect
+    timeout) instead of failing fast — defeating the point of a health
+    check. Fixed by adding `connect_args={"connect_timeout": 5}` to
+    `src/churn/db/engine.py`'s shared engine; re-verified live,
+    `/health` now bounds at ~5.1s instead of hanging. See
+    [DECISIONS.md#db-engine-needed-an-explicit-connect-timeout-for-graceful-degradation-to-actually-work](DECISIONS.md#db-engine-needed-an-explicit-connect-timeout-for-graceful-degradation-to-actually-work).
+  - **Dependencies**: `shap` moved from the `notebooks` group to
+    `dependencies` (same per-phase policy as Phase 5's
+    scikit-learn/mlflow move); `fastapi`/`uvicorn[standard]`/
+    `prometheus-client` added explicitly (were already present
+    transitively via mlflow's own bundled server — see DECISIONS.md);
+    `httpx` added to the `dev` group for `fastapi.testclient.TestClient`.
+  - 18 new unit tests: 9 for `inference.py` (scoring-cohort/risk-band
+    boundary cases, plus a real — not mocked — SHAP computation on a toy
+    fitted pipeline) and 9 for the API (health/predictions/score across
+    the happy path, not-found, and DB-unreachable cases, request-ID
+    behavior, `/metrics`). `ruff`, `black --check`, `mypy --strict` clean
+    on `src`, `pipelines`, and `api` (lint/format/type-check commands
+    widened to cover all three, matching the fact that `pipelines/`
+    already existed since Phase 5 but was never actually added to the
+    documented lint scope until now).
 
 ### Phase 7 — Monitoring + dashboard — Not started
 
